@@ -10,7 +10,16 @@ from dagster import (
     DailyPartitionsDefinition,
     Definitions,
     asset,
+    in_process_executor,
 )
+
+# Warm up nselib imports so subprocesses don't pay the cost
+import importlib
+for mod_name in ("nselib.capital_market", "nselib.derivatives", "nselib.indices"):
+    try:
+        importlib.import_module(mod_name)
+    except ImportError:
+        pass
 
 INGESTION_SRC = "/opt/dagster/ingestion-src"
 if INGESTION_SRC not in sys.path:
@@ -19,7 +28,11 @@ if INGESTION_SRC not in sys.path:
 from pinaka_ingestion.jobs import ingest_dataset_for_date
 from pinaka_ingestion.nse_client import RAW_DATASETS
 from pinaka_ingestion.pipeline.bronze import bronze_dataset_for_date
-from pinaka_ingestion.pipeline.gold import compute_features_for_date
+from pinaka_ingestion.pipeline.gold import (
+    compute_features_for_date,
+    compute_fo_oi_features_for_date,
+)
+from pinaka_ingestion.pipeline.duckdb_layer import refresh_gold_tables
 from pinaka_ingestion.s3_raw import _s3_client
 
 _ENDPOINT_URL = os.getenv("PINAKA_MINISTACK_ENDPOINT", "http://ministack:4566")
@@ -41,7 +54,7 @@ class BronzeConfig(Config):
 
 class GoldConfig(Config):
     gold_bucket: str = _GOLD_BUCKET
-    lookback_days: int = 30
+    lookback_days: int = 60
 
 
 def _list_raw_keys(dataset: str, trade_date_iso: str) -> list[str]:
@@ -79,7 +92,7 @@ def make_raw_asset(dataset: str):
         description=f"Raw {dataset} data from NSE via nselib, stored in S3",
         group_name="raw",
     )
-    def _asset(context: AssetExecutionContext, config: DatasetConfig) -> dict:
+    def _asset(context: AssetExecutionContext, config: DatasetConfig) -> None:
         trade_date = datetime.strptime(context.partition_key, "%Y-%m-%d").date()
         context.log.info("Ingesting %s for %s", dataset, trade_date)
 
@@ -98,7 +111,6 @@ def make_raw_asset(dataset: str):
             dataset, trade_date,
             result.get("skipped"), result.get("row_count"), result.get("s3_uri"),
         )
-        return result
 
     _asset.__name__ = f"{dataset}_raw"
     return _asset
@@ -113,14 +125,14 @@ def make_bronze_asset(dataset: str):
         group_name="bronze",
         deps=[AssetKey(f"{dataset}_raw")],
     )
-    def _asset(context: AssetExecutionContext, config: BronzeConfig) -> dict:
+    def _asset(context: AssetExecutionContext, config: BronzeConfig) -> None:
         trade_date = datetime.strptime(context.partition_key, "%Y-%m-%d").date()
         trade_date_iso = trade_date.isoformat()
 
         raw_keys = _list_raw_keys(dataset, trade_date_iso)
         if not raw_keys:
             context.log.warning("No raw keys found for %s/%s, skipping bronze", dataset, trade_date_iso)
-            return {"dataset": dataset, "trade_date": trade_date_iso, "skipped": True}
+            return
 
         raw_records = _read_s3_records(_RAW_BUCKET, raw_keys)
         context.log.info("Normalizing %s to bronze for %s (%d records)", dataset, trade_date, len(raw_records))
@@ -138,7 +150,6 @@ def make_bronze_asset(dataset: str):
             "%s/bronze/%s: rows=%s, uri=%s",
             dataset, trade_date, result.get("row_count"), result.get("s3_uri"),
         )
-        return result
 
     _asset.__name__ = f"{dataset}_bronze"
     return _asset
@@ -153,7 +164,7 @@ def make_gold_asset(dataset: str):
         group_name="gold",
         deps=[AssetKey(f"{dataset}_bronze")],
     )
-    def _asset(context: AssetExecutionContext, config: GoldConfig) -> dict:
+    def _asset(context: AssetExecutionContext, config: GoldConfig) -> None:
         trade_date = datetime.strptime(context.partition_key, "%Y-%m-%d").date()
 
         context.log.info("Computing gold features for %s/%s", dataset, trade_date)
@@ -172,16 +183,77 @@ def make_gold_asset(dataset: str):
             "%s/gold/%s: symbols=%s, uri=%s",
             dataset, trade_date, result.get("symbols"), result.get("s3_uri"),
         )
-        return result
 
     _asset.__name__ = f"{dataset}_features"
     return _asset
 
 
+def make_duckdb_asset():
+    @asset(
+        name="duckdb_refresh",
+        partitions_def=daily_partitions,
+        kinds={"duckdb", "s3"},
+        description="Refresh DuckDB materialized tables from gold/bronze S3 data",
+        group_name="analytics",
+        deps=[
+            AssetKey("bhavcopy_eq_features"),
+            AssetKey("fo_oi_features"),
+        ],
+    )
+    def _asset(context: AssetExecutionContext) -> None:
+        trade_date = datetime.strptime(context.partition_key, "%Y-%m-%d").date()
+        context.log.info("Refreshing DuckDB tables for %s", trade_date)
+
+        result = refresh_gold_tables(
+            trade_dates=[trade_date],
+            gold_bucket=_GOLD_BUCKET,
+            bronze_bucket=_BRONZE_BUCKET,
+            endpoint_url=_ENDPOINT_URL,
+            region_name=_AWS_REGION,
+        )
+
+        context.log.info("DuckDB refreshed: %s", result)
+
+    _asset.__name__ = "duckdb_refresh"
+    return _asset
+
+
+def make_fo_oi_gold_asset():
+    @asset(
+        name="fo_oi_features",
+        partitions_def=daily_partitions,
+        kinds={"s3"},
+        description="Gold OI analytics computed from fo_oi bronze data",
+        group_name="gold",
+        deps=[AssetKey("fo_oi_bronze")],
+    )
+    def _asset(context: AssetExecutionContext) -> None:
+        trade_date = datetime.strptime(context.partition_key, "%Y-%m-%d").date()
+
+        context.log.info("Computing fo_oi gold features for %s", trade_date)
+
+        result = compute_fo_oi_features_for_date(
+            trade_date=trade_date,
+            bronze_bucket=_BRONZE_BUCKET,
+            gold_bucket=_GOLD_BUCKET,
+            endpoint_url=_ENDPOINT_URL,
+            region_name=_AWS_REGION,
+        )
+
+        context.log.info(
+            "fo_oi/gold/%s: records=%s, uri=%s",
+            trade_date, result.get("records"), result.get("s3_uri"),
+        )
+
+    _asset.__name__ = "fo_oi_features"
+    return _asset
+
+
 raw_assets = [make_raw_asset(ds) for ds in RAW_DATASETS]
 bronze_assets = [make_bronze_asset(ds) for ds in RAW_DATASETS]
-gold_assets = [make_gold_asset("bhavcopy_eq")]
+gold_assets = [make_gold_asset("bhavcopy_eq"), make_fo_oi_gold_asset()]
+analytics_assets = [make_duckdb_asset()]
 
-all_assets = [*raw_assets, *bronze_assets, *gold_assets]
+all_assets = [*raw_assets, *bronze_assets, *gold_assets, *analytics_assets]
 
-defs = Definitions(assets=all_assets)
+defs = Definitions(assets=all_assets, executor=in_process_executor)

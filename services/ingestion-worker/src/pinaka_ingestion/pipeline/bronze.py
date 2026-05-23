@@ -9,34 +9,106 @@ from ..s3_raw import (
 )
 
 
-_BRONZE_SCHEMAS: dict[str, set[str]] = {
+_BRONZE_COLUMN_MAP: dict[str, dict[str, str]] = {
     "bhavcopy_eq": {
-        "symbol", "series", "open", "high", "low", "close", "last",
-        "prevclose", "totaltradedquantity", "totaltradedvalue",
-        "timestamp", "trade_date",
+        "symbol": "symbol",
+        "series": "series",
+        "DATE1": "trade_date",
+        "prev_close": "prev_close",
+        "open_price": "open",
+        "high_price": "high",
+        "low_price": "low",
+        "last_price": "last",
+        "close_price": "close",
+        "ttl_trd_qnty": "totaltradedquantity",
+        "turnover_lacs": "totaltradedvalue",
+        "PREV_CLOSE": "prev_close",
+        "OPEN_PRICE": "open",
+        "HIGH_PRICE": "high",
+        "LOW_PRICE": "low",
+        "LAST_PRICE": "last",
+        "CLOSE_PRICE": "close",
+        "AVG_PRICE": "avg_price",
+        "TTL_TRD_QNTY": "totaltradedquantity",
+        "TURNOVER_LACS": "totaltradedvalue",
+        "NO_OF_TRADES": "no_of_trades",
+        "DELIV_QTY": "deliv_qty",
+        "DELIV_PER": "deliv_per",
     },
     "deliverable_eq": {
-        "symbol", "delivered_quantity", "delivery_percentage",
-        "total_traded_quantity", "trade_date",
+        "symbol": "symbol",
+        "delivered_quantity": "delivered_quantity",
+        "delivery_percentage": "delivery_percentage",
+        "total_traded_quantity": "total_traded_quantity",
+        "trade_date": "trade_date",
     },
     "corp_actions": {
-        "symbol", "ex_date", "purpose", "action_type",
-        "face_value", "record_date", "bc_start_date", "bc_end_date",
-        "trade_date",
+        "symbol": "symbol",
+        "ex_date": "ex_date",
+        "purpose": "purpose",
+        "action_type": "action_type",
+        "face_value": "face_value",
+        "record_date": "record_date",
+        "bc_start_date": "bc_start_date",
+        "bc_end_date": "bc_end_date",
+        "trade_date": "trade_date",
     },
     "index_constituents": {
-        "symbol", "company_name", "index_name", "weight_percentage",
-        "industry", "trade_date",
+        "symbol": "symbol",
+        "company_name": "company_name",
+        "index_name": "index_name",
+        "weight_percentage": "weight_percentage",
+        "industry": "industry",
+        "trade_date": "trade_date",
     },
     "fo_oi": {
-        "symbol", "instrument", "expiry_date", "option_type",
-        "strike_price", "open_interest", "change_in_oi",
-        "volume", "trade_date",
+        "Client Type": "client_type",
+        "client_type": "client_type",
+        "Future Index Long": "future_index_long",
+        "future_index_long": "future_index_long",
+        "Future Index Short": "future_index_short",
+        "future_index_short": "future_index_short",
+        "Future Stock Long": "future_stock_long",
+        "future_stock_long": "future_stock_long",
+        "Future Stock Short       ": "future_stock_short",
+        "Future Stock Short": "future_stock_short",
+        "future_stock_short": "future_stock_short",
+        "Option Index Call Long": "option_index_call_long",
+        "option_index_call_long": "option_index_call_long",
+        "Option Index Put Long": "option_index_put_long",
+        "option_index_put_long": "option_index_put_long",
+        "Option Index Call Short": "option_index_call_short",
+        "option_index_call_short": "option_index_call_short",
+        "Option Index Put Short": "option_index_put_short",
+        "option_index_put_short": "option_index_put_short",
+        "Option Stock Call Long": "option_stock_call_long",
+        "option_stock_call_long": "option_stock_call_long",
+        "Option Stock Put Long": "option_stock_put_long",
+        "option_stock_put_long": "option_stock_put_long",
+        "Option Stock Call Short": "option_stock_call_short",
+        "option_stock_call_short": "option_stock_call_short",
+        "Option Stock Put Short": "option_stock_put_short",
+        "option_stock_put_short": "option_stock_put_short",
+        "Total Long Contracts      ": "total_long_contracts",
+        "Total Long Contracts": "total_long_contracts",
+        "total_long_contracts": "total_long_contracts",
+        "Total Short Contracts": "total_short_contracts",
+        "total_short_contracts": "total_short_contracts",
+        "trade_date": "trade_date",
     },
     "block_deals": {
-        "symbol", "client_name", "deal_type", "quantity",
-        "price", "value", "trade_date",
+        "symbol": "symbol",
+        "client_name": "client_name",
+        "deal_type": "deal_type",
+        "quantity": "quantity",
+        "price": "price",
+        "value": "value",
+        "trade_date": "trade_date",
     },
+}
+
+_BRONZE_ALLOWED_FIELDS: dict[str, set[str]] = {
+    ds: set(m.values()) for ds, m in _BRONZE_COLUMN_MAP.items()
 }
 
 
@@ -57,13 +129,17 @@ def _normalize_field(value):
 
 
 def _normalize_record(dataset: str, record: dict) -> dict:
-    expected_fields = _BRONZE_SCHEMAS.get(dataset, set())
+    column_map = _BRONZE_COLUMN_MAP.get(dataset, {})
+    allowed = _BRONZE_ALLOWED_FIELDS.get(dataset)
     clean: dict = {}
     for raw_key, value in record.items():
-        key = raw_key.strip().lower().replace(" ", "_").replace("-", "_")
-        if expected_fields and key not in expected_fields:
+        norm_key = raw_key.strip().lower().replace(" ", "_").replace("-", "_")
+        canonical = column_map.get(raw_key) or column_map.get(norm_key)
+        if canonical is None:
             continue
-        clean[key] = _normalize_field(value)
+        if allowed and canonical not in allowed:
+            continue
+        clean[canonical] = _normalize_field(value)
     return clean
 
 

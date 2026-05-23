@@ -1,184 +1,154 @@
 from __future__ import annotations
 
 import json
-import math
-from datetime import date
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, timedelta
 from typing import Any
 from uuid import uuid4
+
+import polars as pl
 
 from ..s3_raw import _s3_client, current_utc_iso, put_payload_json
 
 
-def _read_bronze_records(
+def _collect_bronze_range(
     *,
     dataset: str,
-    trade_date: date,
-    bucket: str = "pinaka-bronze",
-    endpoint_url: str = "http://ministack:4566",
-    region_name: str = "ap-south-1",
+    start_date: date,
+    end_date: date,
+    bucket: str,
+    endpoint_url: str,
+    region_name: str,
+    max_workers: int = 8,
 ) -> list[dict]:
     client = _s3_client(endpoint_url=endpoint_url, region_name=region_name)
-    prefix = f"nse/{dataset}/dt={trade_date.isoformat()}/"
-    keys: list[str] = []
-    continuation_token = None
+    all_keys: list[tuple[str, str]] = []
 
-    while True:
-        if continuation_token:
-            response = client.list_objects_v2(
-                Bucket=bucket, Prefix=prefix, ContinuationToken=continuation_token
-            )
-        else:
-            response = client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    cursor = start_date
+    while cursor <= end_date:
+        prefix = f"nse/{dataset}/dt={cursor.isoformat()}/"
+        token = None
+        while True:
+            kwargs = dict(Bucket=bucket, Prefix=prefix)
+            if token:
+                kwargs["ContinuationToken"] = token
+            resp = client.list_objects_v2(**kwargs)
+            for item in resp.get("Contents", []):
+                all_keys.append((item["Key"], cursor.isoformat()))
+            if not resp.get("IsTruncated"):
+                break
+            token = resp.get("NextContinuationToken")
+        cursor += timedelta(days=1)
 
-        contents = response.get("Contents", [])
-        keys.extend(item["Key"] for item in contents)
-        if not response.get("IsTruncated"):
-            break
-        continuation_token = response.get("NextContinuationToken")
+    all_records: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {}
+        for key, dt_str in all_keys:
+            fut = pool.submit(_download_s3_json, client, bucket, key)
+            futures[fut] = dt_str
 
-    records: list[dict] = []
-    for key in keys:
-        obj = client.get_object(Bucket=bucket, Key=key)
-        payload = json.loads(obj["Body"].read().decode("utf-8"))
-        records.extend(payload.get("records", []))
+        for fut in as_completed(futures):
+            dt_str = futures[fut]
+            try:
+                records = fut.result()
+                for r in records:
+                    r["trade_date"] = dt_str
+                all_records.extend(records)
+            except Exception:
+                pass
 
-    return records
-
-
-def _safe_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (ValueError, TypeError):
-        return None
-
-
-def compute_rsi(prices: list[float], period: int = 14) -> list[float | None]:
-    if len(prices) < period + 1:
-        return [None] * len(prices)
-
-    rsi_values: list[float | None] = [None] * period
-    gains: list[float] = []
-    losses: list[float] = []
-
-    for i in range(1, period + 1):
-        diff = prices[i] - prices[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    if avg_loss == 0:
-        rsi_values.append(100.0)
-    else:
-        rs = avg_gain / avg_loss
-        rsi_values.append(100.0 - (100.0 / (1.0 + rs)))
-
-    for i in range(period + 1, len(prices)):
-        diff = prices[i] - prices[i - 1]
-        gain = max(diff, 0)
-        loss = max(-diff, 0)
-        avg_gain = ((avg_gain * (period - 1)) + gain) / period
-        avg_loss = ((avg_loss * (period - 1)) + loss) / period
-        if avg_loss == 0:
-            rsi_values.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            rsi_values.append(100.0 - (100.0 / (1.0 + rs)))
-
-    return rsi_values
+    return all_records
 
 
-def compute_sma(prices: list[float], period: int = 20) -> list[float | None]:
-    result: list[float | None] = [None] * (period - 1)
-    for i in range(period - 1, len(prices)):
-        result.append(sum(prices[i - period + 1 : i + 1]) / period)
-    return result
+def _download_s3_json(client, bucket: str, key: str) -> list[dict]:
+    obj = client.get_object(Bucket=bucket, Key=key)
+    payload = json.loads(obj["Body"].read().decode("utf-8"))
+    return payload.get("records", [])
 
 
-def compute_ema(prices: list[float], period: int = 20) -> list[float | None]:
-    if len(prices) < period:
-        return [None] * len(prices)
+def compute_fo_oi_features_for_date(
+    *,
+    trade_date: date,
+    dataset: str = "fo_oi",
+    bronze_bucket: str = "pinaka-bronze",
+    gold_bucket: str = "pinaka-gold",
+    endpoint_url: str = "http://ministack:4566",
+    region_name: str = "ap-south-1",
+) -> dict:
+    raw = _collect_bronze_range(
+        dataset=dataset,
+        start_date=trade_date,
+        end_date=trade_date,
+        bucket=bronze_bucket,
+        endpoint_url=endpoint_url,
+        region_name=region_name,
+    )
 
-    multiplier = 2.0 / (period + 1)
-    ema_values: list[float | None] = [None] * (period - 1)
-    ema = sum(prices[:period]) / period
-    ema_values.append(ema)
+    if not raw:
+        return {"dataset": dataset, "trade_date": trade_date.isoformat(), "records": 0}
 
-    for price in prices[period:]:
-        ema = (price - ema) * multiplier + ema
-        ema_values.append(ema)
+    df = pl.DataFrame(raw)
 
-    return ema_values
+    needed = {"client_type", "future_index_long", "future_index_short",
+              "future_stock_long", "future_stock_short",
+              "option_index_call_long", "option_index_put_long",
+              "option_index_call_short", "option_index_put_short",
+              "option_stock_call_long", "option_stock_put_long",
+              "option_stock_call_short", "option_stock_put_short",
+              "total_long_contracts", "total_short_contracts"}
+    if not needed.issubset(set(df.columns)):
+        return {"dataset": dataset, "trade_date": trade_date.isoformat(), "records": 0}
 
+    num_cols = [c for c in df.columns if c not in ("client_type", "trade_date")]
+    for c in num_cols:
+        df = df.with_columns(pl.col(c).cast(pl.Float64).fill_nan(None))
 
-def compute_macd(
-    prices: list[float],
-    fast: int = 12,
-    slow: int = 26,
-    signal: int = 9,
-) -> tuple[list[float | None], list[float | None], list[float | None]]:
-    ema_fast = compute_ema(prices, fast)
-    ema_slow = compute_ema(prices, slow)
+    df = df.with_columns([
+        (pl.col("future_index_long") + pl.col("future_stock_long")
+         - pl.col("future_index_short") - pl.col("future_stock_short")).alias("net_futures"),
+        (pl.col("option_index_call_long") + pl.col("option_stock_call_long")
+         + pl.col("option_index_put_long") + pl.col("option_stock_put_long")
+         - pl.col("option_index_call_short") - pl.col("option_stock_call_short")
+         - pl.col("option_index_put_short") - pl.col("option_stock_put_short")).alias("net_options"),
+        (pl.col("total_long_contracts") - pl.col("total_short_contracts")).alias("net_total"),
+        (pl.col("total_long_contracts") / pl.col("total_short_contracts").clip(1)).alias("long_short_ratio"),
+        ((pl.col("option_index_put_long") + pl.col("option_stock_put_long"))
+         / (pl.col("option_index_call_long") + pl.col("option_stock_call_long")).clip(1)).alias("put_call_ratio"),
+    ])
 
-    macd_line: list[float | None] = [None] * (slow - 1)
-    for i in range(slow - 1, len(prices)):
-        f = ema_fast[i]
-        s = ema_slow[i]
-        macd_line.append(f - s if (f is not None and s is not None) else None)
+    records = df.to_dicts()
+    for r in records:
+        for k, v in r.items():
+            if isinstance(v, float | int) and v != v:
+                r[k] = None
+        r["trade_date"] = trade_date.isoformat()
 
-    macd_values = [v for v in macd_line if v is not None]
-    if not macd_values:
-        return macd_line, [None] * len(prices), [None] * len(prices)
+    run_id = uuid4().hex
+    object_key = f"features/{dataset}/dt={trade_date.isoformat()}/run_id={run_id}/features.json"
 
-    signal_line: list[float | None] = [None] * (slow + signal - 2)
-    m = compute_ema(macd_values, signal)
-    signal_line[slow + signal - 2 - len(m) + 1:] = m if m else []
-    while len(signal_line) < len(prices):
-        signal_line.insert(0, None)
+    payload = {
+        "dataset": dataset,
+        "trade_date": trade_date.isoformat(),
+        "gold_at_utc": current_utc_iso(),
+        "run_id": run_id,
+        "records": len(records),
+        "records": records,
+    }
 
-    histogram: list[float | None] = []
-    for i in range(len(prices)):
-        m_line = macd_line[i]
-        s_line = signal_line[i]
-        histogram.append(
-            (m_line - s_line) if (m_line is not None and s_line is not None) else None
-        )
+    s3_uri = put_payload_json(
+        bucket=gold_bucket, key=object_key, payload=payload,
+        endpoint_url=endpoint_url, region_name=region_name,
+    )
 
-    return macd_line, signal_line, histogram
-
-
-def _compute_symbol_indicators(
-    records: list[dict],
-    closes: list[float],
-    highs: list[float],
-    lows: list[float],
-    volumes: list[float],
-) -> list[dict]:
-    if not closes:
-        return []
-
-    sma_20 = compute_sma(closes, 20)
-    ema_20 = compute_ema(closes, 20)
-    rsi_14 = compute_rsi(closes, 14)
-    macd_line, macd_signal, macd_hist = compute_macd(closes)
-
-    results: list[dict] = []
-    for i in range(len(records)):
-        results.append({
-            "symbol": records[i].get("symbol"),
-            "trade_date": records[i].get("trade_date"),
-            "close": closes[i],
-            "volume": volumes[i] if i < len(volumes) else None,
-            "sma_20": sma_20[i] if i < len(sma_20) else None,
-            "ema_20": ema_20[i] if i < len(ema_20) else None,
-            "rsi_14": rsi_14[i] if i < len(rsi_14) else None,
-            "macd": macd_line[i] if i < len(macd_line) else None,
-            "macd_signal": macd_signal[i] if i < len(macd_signal) else None,
-            "macd_histogram": macd_hist[i] if i < len(macd_hist) else None,
-        })
-    return results
+    return {
+        "dataset": dataset,
+        "trade_date": trade_date.isoformat(),
+        "records": len(records),
+        "bucket": gold_bucket,
+        "object_key": object_key,
+        "s3_uri": s3_uri,
+        "run_id": run_id,
+    }
 
 
 def compute_features_for_date(
@@ -191,40 +161,113 @@ def compute_features_for_date(
     region_name: str = "ap-south-1",
     lookback_days: int = 30,
 ) -> dict:
-    all_records = _read_bronze_records(
+    start_date = trade_date - timedelta(days=lookback_days)
+
+    raw = _collect_bronze_range(
         dataset=dataset,
-        trade_date=trade_date,
+        start_date=start_date,
+        end_date=trade_date,
         bucket=bronze_bucket,
         endpoint_url=endpoint_url,
         region_name=region_name,
     )
-    if not all_records:
+
+    if not raw:
         return {
             "dataset": dataset,
             "trade_date": trade_date.isoformat(),
-            "row_count": 0,
-            "features_computed": 0,
+            "symbols": 0,
         }
 
-    symbols: dict[str, list[dict]] = {}
-    for rec in all_records:
-        sym = rec.get("symbol")
-        if sym:
-            symbols.setdefault(str(sym), []).append(rec)
+    df = pl.DataFrame(raw)
 
-    features: list[dict] = []
-    for sym, recs in symbols.items():
-        closes = [_safe_float(r.get("close")) for r in recs if _safe_float(r.get("close")) is not None]
-        highs = [_safe_float(r.get("high")) for r in recs if _safe_float(r.get("high")) is not None]
-        lows = [_safe_float(r.get("low")) for r in recs if _safe_float(r.get("low")) is not None]
-        volumes = [_safe_float(r.get("totaltradedquantity")) for r in recs if _safe_float(r.get("totaltradedquantity")) is not None]
+    str_cols = [s for s in ["symbol", "trade_date"] if s in df.columns]
+    num_cols = [s for s in ["close", "high", "low", "totaltradedquantity", "volume", "open"] if s in df.columns]
 
-        if not closes:
-            continue
+    df = df.with_columns([
+        pl.col(c).cast(pl.Utf8).alias(c) for c in str_cols
+    ])
+    for c in num_cols:
+        df = df.with_columns(
+            pl.col(c).cast(pl.Float64).fill_nan(None).alias(c)
+        )
 
-        sym_features = _compute_symbol_indicators(recs, closes, highs, lows, volumes)
-        if sym_features:
-            features.append(sym_features[-1])
+    if df.height == 0 or "symbol" not in df.columns or "close" not in df.columns:
+        return {
+            "dataset": dataset,
+            "trade_date": trade_date.isoformat(),
+            "symbols": 0,
+        }
+
+    df = df.sort(["symbol", "trade_date"])
+
+    df = df.with_columns([
+        pl.col("close").rolling_mean(window_size=20, min_periods=1).over("symbol").alias("sma_20"),
+        pl.col("close").ewm_mean(span=20, adjust=False).over("symbol").alias("ema_20"),
+    ])
+
+    df = df.with_columns(
+        pl.col("close").diff().over("symbol").alias("_price_change")
+    )
+
+    df = df.with_columns([
+        pl.when(pl.col("_price_change") > 0)
+        .then(pl.col("_price_change"))
+        .otherwise(0)
+        .over("symbol")
+        .alias("_gain"),
+        pl.when(pl.col("_price_change") < 0)
+        .then(-pl.col("_price_change"))
+        .otherwise(0)
+        .over("symbol")
+        .alias("_loss"),
+    ])
+
+    df = df.with_columns([
+        pl.col("_gain").ewm_mean(alpha=1 / 14, adjust=False).over("symbol").alias("_avg_gain"),
+        pl.col("_loss").ewm_mean(alpha=1 / 14, adjust=False).over("symbol").alias("_avg_loss"),
+    ])
+
+    df = df.with_columns(
+        (100.0 - 100.0 / (1.0 + pl.col("_avg_gain") / pl.col("_avg_loss").clip(1e-10))).alias("rsi_14")
+    )
+
+    df = df.with_columns([
+        pl.col("close").ewm_mean(span=12, adjust=False).over("symbol").alias("_ema_12"),
+        pl.col("close").ewm_mean(span=26, adjust=False).over("symbol").alias("_ema_26"),
+    ])
+
+    df = df.with_columns(
+        (pl.col("_ema_12") - pl.col("_ema_26")).alias("macd")
+    )
+
+    df = df.with_columns(
+        pl.col("macd").ewm_mean(span=9, adjust=False).over("symbol").alias("macd_signal")
+    )
+
+    df = df.with_columns(
+        (pl.col("macd") - pl.col("macd_signal")).alias("macd_histogram")
+    )
+
+    target = df.filter(pl.col("trade_date") == trade_date.isoformat())
+
+    records = target.select([
+        "symbol",
+        "trade_date",
+        "close",
+        "totaltradedquantity",
+        "sma_20",
+        "ema_20",
+        "rsi_14",
+        "macd",
+        "macd_signal",
+        "macd_histogram",
+    ]).to_dicts()
+
+    for r in records:
+        for k, v in r.items():
+            if isinstance(v, float | int) and v != v:
+                r[k] = None
 
     run_id = uuid4().hex
     object_key = f"features/{dataset}/dt={trade_date.isoformat()}/run_id={run_id}/features.json"
@@ -234,8 +277,8 @@ def compute_features_for_date(
         "trade_date": trade_date.isoformat(),
         "gold_at_utc": current_utc_iso(),
         "run_id": run_id,
-        "symbols": len(features),
-        "records": features,
+        "symbols": len(records),
+        "records": records,
     }
 
     s3_uri = put_payload_json(
@@ -249,7 +292,7 @@ def compute_features_for_date(
     return {
         "dataset": dataset,
         "trade_date": trade_date.isoformat(),
-        "symbols": len(features),
+        "symbols": len(records),
         "bucket": gold_bucket,
         "object_key": object_key,
         "s3_uri": s3_uri,

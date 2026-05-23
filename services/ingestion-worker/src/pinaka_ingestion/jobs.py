@@ -40,13 +40,15 @@ def ingest_dataset_for_date(
 ) -> dict:
     trade_date_iso = trade_date.isoformat()
 
-    existing_keys = list_raw_partition_keys(
-        bucket=bucket,
-        dataset=dataset,
-        trade_date=trade_date_iso,
-        endpoint_url=endpoint_url,
-        region_name=region_name,
-    )
+    existing_keys: list[str] = []
+    if not allow_reingest:
+        existing_keys = list_raw_partition_keys(
+            bucket=bucket,
+            dataset=dataset,
+            trade_date=trade_date_iso,
+            endpoint_url=endpoint_url,
+            region_name=region_name,
+        )
 
     if existing_keys and not allow_reingest:
         return {
