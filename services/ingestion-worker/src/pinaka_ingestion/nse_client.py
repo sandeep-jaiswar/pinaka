@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from typing import Any, Callable
 
 
 class NseLibError(RuntimeError):
@@ -26,7 +26,6 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, date):
         return value.isoformat()
 
-    # pandas/numpy scalars usually expose item()
     item = getattr(value, "item", None)
     if callable(item):
         try:
@@ -57,49 +56,123 @@ def _rows_from_frame_like(frame_like: Any) -> list[dict]:
     raise NseLibError(f"Unsupported nselib response type: {type(frame_like)!r}")
 
 
-def fetch_bhavcopy_eq(trade_date: date) -> dict:
-    try:
-        from nselib import capital_market
-    except Exception as exc:
-        raise NseLibError("Failed to import nselib. Install pinaka-ingestion-worker deps.") from exc
-
+def _try_extract(
+    trade_date: date,
+    candidates: list[tuple[str, Callable[[str], Any]]],
+) -> tuple[str, list[dict]]:
     trade_date_ddmmyyyy = trade_date.strftime("%d-%m-%Y")
-
-    candidate_functions: list[tuple[str, Any]] = [
-        ("bhav_copy_with_delivery", getattr(capital_market, "bhav_copy_with_delivery", None)),
-        ("bhav_copy_equities", getattr(capital_market, "bhav_copy_equities", None)),
-    ]
-
     errors: list[str] = []
-    for function_name, function_ref in candidate_functions:
+    for function_name, function_ref in candidates:
         if not callable(function_ref):
             continue
         try:
             frame_like = function_ref(trade_date=trade_date_ddmmyyyy)
             rows = _rows_from_frame_like(frame_like)
-            return {
-                "dataset": "bhavcopy_eq",
-                "trade_date": trade_date.isoformat(),
-                "source": "nselib",
-                "source_function": function_name,
-                "row_count": len(rows),
-                "records": rows,
-            }
+            return function_name, rows
         except Exception as exc:
             errors.append(f"{function_name}: {exc}")
 
-    joined = "; ".join(errors) if errors else "No compatible nselib bhavcopy function found."
-    raise NseLibError(f"Unable to fetch bhavcopy equities for {trade_date.isoformat()}. {joined}")
+    joined = "; ".join(errors) if errors else "No compatible nselib function found."
+    raise NseLibError(f"Failed to extract for {trade_date.isoformat()}. {joined}")
+
+
+def _make_result(
+    dataset: str,
+    trade_date: date,
+    source_function: str,
+    records: list[dict],
+) -> dict:
+    return {
+        "dataset": dataset,
+        "trade_date": trade_date.isoformat(),
+        "source": "nselib",
+        "source_function": source_function,
+        "row_count": len(records),
+        "records": records,
+    }
+
+
+def fetch_bhavcopy_eq(trade_date: date) -> dict:
+    from nselib import capital_market
+
+    fn_name, rows = _try_extract(trade_date, [
+        ("bhav_copy_with_delivery", getattr(capital_market, "bhav_copy_with_delivery", None)),
+        ("bhav_copy_equities", getattr(capital_market, "bhav_copy_equities", None)),
+    ])
+    return _make_result("bhavcopy_eq", trade_date, fn_name, rows)
+
+
+def fetch_deliverable_eq(trade_date: date) -> dict:
+    from nselib import capital_market
+
+    fn_name, rows = _try_extract(trade_date, [
+        ("get_deliverable_position_data", getattr(capital_market, "get_deliverable_position_data", None)),
+        ("deliverable_position_data", getattr(capital_market, "deliverable_position_data", None)),
+    ])
+    return _make_result("deliverable_eq", trade_date, fn_name, rows)
+
+
+def fetch_corp_actions(trade_date: date) -> dict:
+    from nselib import capital_market
+
+    fn_name, rows = _try_extract(trade_date, [
+        ("corporate_actions_for_equity", getattr(capital_market, "corporate_actions_for_equity", None)),
+    ])
+    return _make_result("corp_actions", trade_date, fn_name, rows)
+
+
+def fetch_index_constituents(trade_date: date) -> dict:
+    from nselib import indices
+
+    rows: list[dict] = []
+    for index_name in ["NIFTY 50", "NIFTY NEXT 50", "NIFTY MIDCAP 150", "NIFTY SMALLCAP 250"]:
+        try:
+            frame_like = indices.constituent_stock_list(index_symbol=index_name)
+            index_rows = _rows_from_frame_like(frame_like)
+            for r in index_rows:
+                r["index_name"] = index_name
+            rows.extend(index_rows)
+        except Exception:
+            pass
+
+    return _make_result("index_constituents", trade_date, "constituent_stock_list", rows)
+
+
+def fetch_fo_oi(trade_date: date) -> dict:
+    from nselib import derivatives
+
+    fn_name, rows = _try_extract(trade_date, [
+        ("participant_wise_open_interest", getattr(derivatives, "participant_wise_open_interest", None)),
+    ])
+    return _make_result("fo_oi", trade_date, fn_name, rows)
+
+
+def fetch_block_deals(trade_date: date) -> dict:
+    from nselib import capital_market
+
+    fn_name, rows = _try_extract(trade_date, [
+        ("get_block_deals_data", getattr(capital_market, "get_block_deals_data", None)),
+        ("block_deals_data", getattr(capital_market, "block_deals_data", None)),
+    ])
+    return _make_result("block_deals", trade_date, fn_name, rows)
+
+
+EXTRACTORS: dict[str, Callable[[date], dict]] = {
+    "bhavcopy_eq": fetch_bhavcopy_eq,
+    "deliverable_eq": fetch_deliverable_eq,
+    "corp_actions": fetch_corp_actions,
+    "index_constituents": fetch_index_constituents,
+    "fo_oi": fetch_fo_oi,
+    "block_deals": fetch_block_deals,
+}
+
+RAW_DATASETS: list[str] = list(EXTRACTORS.keys())
 
 
 def fetch_dataset(request: PullRequest) -> dict:
-    if request.dataset == "bhavcopy_eq" and request.start_date == request.end_date:
-        return fetch_bhavcopy_eq(request.start_date)
+    extractor = EXTRACTORS.get(request.dataset)
+    if extractor is None:
+        raise NseLibError(f"Unknown dataset: {request.dataset}. Available: {list(EXTRACTORS)}")
 
-    return {
-        "dataset": request.dataset,
-        "start_date": request.start_date.isoformat(),
-        "end_date": request.end_date.isoformat(),
-        "records": [],
-        "source": "nselib",
-    }
+    result = extractor(request.start_date)
+    return result

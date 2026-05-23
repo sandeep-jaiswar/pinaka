@@ -82,5 +82,25 @@ services:
       - postgres
       - redpanda
 
+  dagster-daemon:
+    build:
+      context: ../..
+      dockerfile: services/orchestrator-dagster/Dockerfile
+    container_name: pinaka_dagster_daemon
+    environment:
+      - DAGSTER_HOME=/opt/dagster/dagster_home
+      - PINAKA_MINISTACK_ENDPOINT=http://ministack:4566
+      - PINAKA_POSTGRES_DSN=postgresql://pinaka:pinaka@postgres:5432/pinaka_meta
+      - PINAKA_KAFKA_BROKERS=redpanda:9092
+    volumes:
+      - ../../services/orchestrator-dagster/dagster_home:/opt/dagster/dagster_home
+      - ../../services/orchestrator-dagster/repo:/opt/dagster/repo
+      - ../../services/ingestion-worker/src:/opt/dagster/ingestion-src
+    command: ["dagster-daemon", "run", "-w", "/opt/dagster/dagster_home/workspace.yaml"]
+    depends_on:
+      - ministack
+      - postgres
+      - redpanda
+
 volumes:
   postgres_data:

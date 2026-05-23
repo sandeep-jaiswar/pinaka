@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
-from .nse_client import PullRequest, fetch_bhavcopy_eq, fetch_dataset
+from .nse_client import EXTRACTORS, NseLibError, PullRequest, RAW_DATASETS
 from .s3_raw import (
     build_raw_object_key,
     current_utc_iso,
@@ -10,10 +11,12 @@ from .s3_raw import (
     list_raw_partition_keys,
     put_payload_json,
 )
-from .state_store import build_chunks
+from .state_store import BackfillChunk, build_chunks
 
 
 def backfill_plan(dataset: str, start_date: date, end_date: date, chunk_days: int) -> list[dict]:
+    if dataset not in EXTRACTORS:
+        raise ValueError(f"Unknown dataset: {dataset}. Available: {RAW_DATASETS}")
     chunks = build_chunks(start_date, end_date, chunk_days)
     return [
         {
@@ -25,13 +28,9 @@ def backfill_plan(dataset: str, start_date: date, end_date: date, chunk_days: in
     ]
 
 
-def run_one_chunk(dataset: str, chunk_start: date, chunk_end: date) -> dict:
-    request = PullRequest(dataset=dataset, start_date=chunk_start, end_date=chunk_end)
-    return fetch_dataset(request)
-
-
-def ingest_bhavcopy_eq_for_date(
+def ingest_dataset_for_date(
     *,
+    dataset: str,
     trade_date: date,
     bucket: str,
     endpoint_url: str,
@@ -40,9 +39,10 @@ def ingest_bhavcopy_eq_for_date(
     allow_reingest: bool,
 ) -> dict:
     trade_date_iso = trade_date.isoformat()
+
     existing_keys = list_raw_partition_keys(
         bucket=bucket,
-        dataset="bhavcopy_eq",
+        dataset=dataset,
         trade_date=trade_date_iso,
         endpoint_url=endpoint_url,
         region_name=region_name,
@@ -50,7 +50,7 @@ def ingest_bhavcopy_eq_for_date(
 
     if existing_keys and not allow_reingest:
         return {
-            "dataset": "bhavcopy_eq",
+            "dataset": dataset,
             "trade_date": trade_date_iso,
             "row_count": 0,
             "bucket": bucket,
@@ -63,17 +63,20 @@ def ingest_bhavcopy_eq_for_date(
         }
 
     run_id = generate_run_id()
-    extract_result = fetch_bhavcopy_eq(trade_date)
-    object_key = build_raw_object_key(dataset="bhavcopy_eq", trade_date=trade_date_iso, run_id=run_id)
+    request = PullRequest(dataset=dataset, start_date=trade_date, end_date=trade_date)
+    extract_result = EXTRACTORS[dataset](trade_date)
+    row_count = extract_result.get("row_count", 0)
+
+    object_key = build_raw_object_key(dataset=dataset, trade_date=trade_date_iso, run_id=run_id)
 
     payload = {
-        "dataset": "bhavcopy_eq",
+        "dataset": dataset,
         "trade_date": trade_date_iso,
         "extracted_at_utc": current_utc_iso(),
         "run_id": run_id,
         "source": "nselib",
         "source_function": extract_result.get("source_function"),
-        "row_count": extract_result.get("row_count", 0),
+        "row_count": row_count,
         "records": extract_result.get("records", []),
     }
 
@@ -88,9 +91,9 @@ def ingest_bhavcopy_eq_for_date(
         )
 
     return {
-        "dataset": "bhavcopy_eq",
+        "dataset": dataset,
         "trade_date": trade_date_iso,
-        "row_count": payload["row_count"],
+        "row_count": row_count,
         "bucket": bucket,
         "object_key": object_key,
         "s3_uri": s3_uri,
@@ -100,56 +103,73 @@ def ingest_bhavcopy_eq_for_date(
     }
 
 
-def ingest_bhavcopy_eq_range(
+def ingest_dataset_range(
     *,
+    dataset: str,
     start_date: date,
     end_date: date,
-    chunk_days: int,
+    chunk_days: int = 30,
     bucket: str,
     endpoint_url: str,
     region_name: str,
-    dry_run: bool,
-    continue_on_error: bool,
-    allow_reingest: bool,
+    dry_run: bool = False,
+    continue_on_error: bool = False,
+    allow_reingest: bool = False,
+    max_workers: int | None = None,
 ) -> dict:
-    chunks = build_chunks(start_date, end_date, chunk_days)
+    all_dates: list[date] = []
+    cursor = start_date
+    while cursor <= end_date:
+        all_dates.append(cursor)
+        cursor += timedelta(days=1)
+
     results: list[dict] = []
     failures: list[dict] = []
+    completed = 0
+    total = len(all_dates)
 
-    for chunk in chunks:
-        trade_date = chunk.start_date
-        while trade_date <= chunk.end_date:
+    if max_workers == 0:
+        max_workers = None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {
+            pool.submit(
+                ingest_dataset_for_date,
+                dataset=dataset,
+                trade_date=d,
+                bucket=bucket,
+                endpoint_url=endpoint_url,
+                region_name=region_name,
+                dry_run=dry_run,
+                allow_reingest=allow_reingest,
+            ): d
+            for d in all_dates
+        }
+
+        for future in as_completed(future_map):
+            d = future_map[future]
+            completed += 1
             try:
-                day_result = ingest_bhavcopy_eq_for_date(
-                    trade_date=trade_date,
-                    bucket=bucket,
-                    endpoint_url=endpoint_url,
-                    region_name=region_name,
-                    dry_run=dry_run,
-                    allow_reingest=allow_reingest,
-                )
+                day_result = future.result()
                 results.append(day_result)
             except Exception as exc:
-                error_entry = {
-                    "trade_date": trade_date.isoformat(),
-                    "error": str(exc),
-                }
-                failures.append(error_entry)
+                failures.append({"trade_date": d.isoformat(), "error": str(exc)})
                 if not continue_on_error:
                     raise RuntimeError(
-                        f"Range ingestion failed on {trade_date.isoformat()}. "
-                        "Re-run with --continue-on-error to skip failing dates."
+                        f"Range ingestion failed on {d.isoformat()} for {dataset} "
+                        f"({completed}/{total}). Re-run with --continue-on-error "
+                        "to skip failing dates."
                     ) from exc
 
-            trade_date += timedelta(days=1)
-
+    results.sort(key=lambda r: r.get("trade_date", ""))
     total_rows = sum(item.get("row_count", 0) for item in results)
     return {
-        "dataset": "bhavcopy_eq",
+        "dataset": dataset,
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "chunk_days": chunk_days,
-        "dates_requested": (end_date - start_date).days + 1,
+        "max_workers": max_workers,
+        "dates_requested": total,
         "dates_succeeded": len(results),
         "dates_failed": len(failures),
         "rows_total": total_rows,
@@ -158,3 +178,104 @@ def ingest_bhavcopy_eq_range(
         "failures": failures,
         "results": results,
     }
+
+
+_RAW_BRONZE_BUCKET = "pinaka-bronze"
+
+
+def _bronze_object_key(dataset: str, trade_date: str, run_id: str) -> str:
+    return f"nse/{dataset}/dt={trade_date}/run_id={run_id}/bronze.json"
+
+
+def normalize_to_bronze(
+    *,
+    dataset: str,
+    raw_records: list[dict],
+    trade_date: str,
+    run_id: str,
+    bucket: str,
+    endpoint_url: str,
+    region_name: str,
+) -> dict:
+    normalized = _normalize_records(dataset, raw_records)
+    object_key = _bronze_object_key(dataset, trade_date, run_id)
+
+    payload = {
+        "dataset": dataset,
+        "trade_date": trade_date,
+        "bronze_at_utc": current_utc_iso(),
+        "run_id": run_id,
+        "source": "nselib",
+        "row_count": len(normalized),
+        "records": normalized,
+    }
+
+    s3_uri = put_payload_json(
+        bucket=bucket,
+        key=object_key,
+        payload=payload,
+        endpoint_url=endpoint_url,
+        region_name=region_name,
+    )
+
+    return {
+        "dataset": dataset,
+        "trade_date": trade_date,
+        "row_count": len(normalized),
+        "bucket": bucket,
+        "object_key": object_key,
+        "s3_uri": s3_uri,
+    }
+
+
+_BRONZE_SCHEMAS: dict[str, set[str]] = {
+    "bhavcopy_eq": {
+        "symbol", "series", "open", "high", "low", "close", "last",
+        "prevclose", "totaltradedquantity", "totaltradedvalue",
+        "timestamp", "trade_date",
+    },
+    "deliverable_eq": {
+        "symbol", "delivered_quantity", "delivery_percentage",
+        "total_traded_quantity", "trade_date",
+    },
+    "corp_actions": {
+        "symbol", "ex_date", "purpose", "action_type",
+        "face_value", "record_date", "bc_start_date", "bc_end_date",
+    },
+    "index_constituents": {
+        "symbol", "company_name", "index_name", "weight",
+        "industry", "trade_date",
+    },
+    "fo_oi": {
+        "symbol", "instrument", "expiry_date", "option_type",
+        "strike_price", "open_interest", "change_in_oi",
+        "volume", "trade_date",
+    },
+    "block_deals": {
+        "symbol", "client_name", "deal_type", "quantity",
+        "price", "value", "trade_date",
+    },
+}
+
+
+def _normalize_records(dataset: str, records: list[dict]) -> list[dict]:
+    expected_fields = _BRONZE_SCHEMAS.get(dataset, set())
+    normalized: list[dict] = []
+    for record in records:
+        clean = {}
+        for key, value in record.items():
+            clean_key = key.strip().lower().replace(" ", "_").replace("-", "_")
+            if expected_fields and clean_key not in expected_fields:
+                continue
+            clean[clean_key] = value
+        normalized.append(clean)
+    return normalized
+
+
+def ingest_bhavcopy_eq_for_date(**kwargs) -> dict:
+    return ingest_dataset_for_date(dataset="bhavcopy_eq", **kwargs)
+
+
+def ingest_bhavcopy_eq_range(**kwargs) -> dict:
+    kwargs.setdefault("dataset", "bhavcopy_eq")
+    return ingest_dataset_range(**kwargs)
