@@ -35,13 +35,6 @@ _BRONZE_COLUMN_MAP: dict[str, dict[str, str]] = {
         "DELIV_QTY": "deliv_qty",
         "DELIV_PER": "deliv_per",
     },
-    "deliverable_eq": {
-        "symbol": "symbol",
-        "delivered_quantity": "delivered_quantity",
-        "delivery_percentage": "delivery_percentage",
-        "total_traded_quantity": "total_traded_quantity",
-        "trade_date": "trade_date",
-    },
     "corp_actions": {
         "symbol": "symbol",
         "ex_date": "ex_date",

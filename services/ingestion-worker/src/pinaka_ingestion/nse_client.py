@@ -102,16 +102,6 @@ def fetch_bhavcopy_eq(trade_date: date) -> dict:
     return _make_result("bhavcopy_eq", trade_date, fn_name, rows)
 
 
-def fetch_deliverable_eq(trade_date: date) -> dict:
-    from nselib import capital_market
-
-    fn_name, rows = _try_extract(trade_date, [
-        ("get_deliverable_position_data", getattr(capital_market, "get_deliverable_position_data", None)),
-        ("deliverable_position_data", getattr(capital_market, "deliverable_position_data", None)),
-    ])
-    return _make_result("deliverable_eq", trade_date, fn_name, rows)
-
-
 def fetch_corp_actions(trade_date: date) -> dict:
     from nselib import capital_market
 
@@ -159,7 +149,6 @@ def fetch_block_deals(trade_date: date) -> dict:
 
 EXTRACTORS: dict[str, Callable[[date], dict]] = {
     "bhavcopy_eq": fetch_bhavcopy_eq,
-    "deliverable_eq": fetch_deliverable_eq,
     "corp_actions": fetch_corp_actions,
     "index_constituents": fetch_index_constituents,
     "fo_oi": fetch_fo_oi,
