@@ -274,6 +274,119 @@ def _normalize_records(dataset: str, records: list[dict]) -> list[dict]:
     return normalized
 
 
+def normalize_raw_to_bronze_for_date(
+    *,
+    dataset: str,
+    trade_date: date,
+    raw_bucket: str = "pinaka-raw",
+    bronze_bucket: str = "pinaka-bronze",
+    endpoint_url: str = "http://ministack:4566",
+    region_name: str = "ap-south-1",
+) -> dict:
+    from .pipeline.bronze import bronze_dataset_for_date
+    from .s3_raw import _s3_client
+    import json
+
+    trade_date_iso = trade_date.isoformat()
+    client = _s3_client(endpoint_url=endpoint_url, region_name=region_name)
+    prefix = f"nse/{dataset}/dt={trade_date_iso}/"
+    raw_keys: list[str] = []
+    token = None
+    while True:
+        kwargs = dict(Bucket=raw_bucket, Prefix=prefix)
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = client.list_objects_v2(**kwargs)
+        raw_keys.extend(item["Key"] for item in resp.get("Contents", []))
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+
+    if not raw_keys:
+        return {"dataset": dataset, "trade_date": trade_date_iso, "row_count": 0, "skipped": True, "skip_reason": "no_raw_data"}
+
+    records: list[dict] = []
+    for key in raw_keys:
+        obj = client.get_object(Bucket=raw_bucket, Key=key)
+        payload = json.loads(obj["Body"].read().decode("utf-8"))
+        records.extend(payload.get("records", []))
+
+    result = bronze_dataset_for_date(
+        dataset=dataset,
+        trade_date=trade_date,
+        raw_records=records,
+        bucket=bronze_bucket,
+        endpoint_url=endpoint_url,
+        region_name=region_name,
+    )
+    result["skipped"] = False
+    return result
+
+
+def normalize_raw_to_bronze_range(
+    *,
+    dataset: str,
+    start_date: date,
+    end_date: date,
+    raw_bucket: str = "pinaka-raw",
+    bronze_bucket: str = "pinaka-bronze",
+    endpoint_url: str = "http://ministack:4566",
+    region_name: str = "ap-south-1",
+    max_workers: int | None = 4,
+    continue_on_error: bool = False,
+) -> dict:
+    all_dates: list[date] = []
+    cursor = start_date
+    while cursor <= end_date:
+        all_dates.append(cursor)
+        cursor += timedelta(days=1)
+
+    results: list[dict] = []
+    failures: list[dict] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {
+            pool.submit(
+                normalize_raw_to_bronze_for_date,
+                dataset=dataset,
+                trade_date=d,
+                raw_bucket=raw_bucket,
+                bronze_bucket=bronze_bucket,
+                endpoint_url=endpoint_url,
+                region_name=region_name,
+            ): d
+            for d in all_dates
+        }
+
+        for fut in as_completed(future_map):
+            d = future_map[fut]
+            try:
+                day_result = fut.result()
+                results.append(day_result)
+            except Exception as exc:
+                failures.append({"trade_date": d.isoformat(), "error": str(exc)})
+                if not continue_on_error:
+                    raise RuntimeError(
+                        f"Bronze normalization failed on {d.isoformat()} for {dataset} "
+                        f"({len(results)}/{len(all_dates)}). "
+                        "Re-run with --continue-on-error to skip failing dates."
+                    ) from exc
+
+    results.sort(key=lambda r: r.get("trade_date", ""))
+    total_rows = sum(item.get("row_count", 0) for item in results)
+    return {
+        "dataset": dataset,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "dates_requested": len(all_dates),
+        "dates_succeeded": len(results),
+        "dates_failed": len(failures),
+        "rows_total": total_rows,
+        "failures": failures,
+        "results": results,
+    }
+
+
 def ingest_bhavcopy_eq_for_date(**kwargs) -> dict:
     return ingest_dataset_for_date(dataset="bhavcopy_eq", **kwargs)
 

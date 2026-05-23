@@ -4,7 +4,13 @@ import argparse
 import json
 from datetime import date, timedelta
 
-from .jobs import backfill_plan, ingest_dataset_for_date, ingest_dataset_range
+from .jobs import (
+    backfill_plan,
+    ingest_dataset_for_date,
+    ingest_dataset_range,
+    normalize_raw_to_bronze_for_date,
+    normalize_raw_to_bronze_range,
+)
 from .nse_client import RAW_DATASETS
 from .pipeline.gold import compute_features_for_date, compute_fo_oi_features_for_date
 
@@ -71,6 +77,25 @@ def main() -> None:
     gold_range.add_argument("--max-workers", type=int, default=4)
     gold_range.add_argument("--continue-on-error", action="store_true")
 
+    bronze = subparsers.add_parser("bronze", help="Normalize raw to bronze for one date")
+    bronze.add_argument("--dataset", choices=RAW_DATASETS, default="bhavcopy_eq")
+    bronze.add_argument("--trade-date", required=True, help="YYYY-MM-DD")
+    bronze.add_argument("--raw-bucket", default="pinaka-raw")
+    bronze.add_argument("--bronze-bucket", default="pinaka-bronze")
+    bronze.add_argument("--endpoint-url", default="http://localhost:4566")
+    bronze.add_argument("--region", default="ap-south-1")
+
+    bronze_range = subparsers.add_parser("bronze-range", help="Normalize raw to bronze for a date range")
+    bronze_range.add_argument("--dataset", choices=RAW_DATASETS, default="bhavcopy_eq")
+    bronze_range.add_argument("--start-date", required=True, help="YYYY-MM-DD")
+    bronze_range.add_argument("--end-date", required=True, help="YYYY-MM-DD")
+    bronze_range.add_argument("--raw-bucket", default="pinaka-raw")
+    bronze_range.add_argument("--bronze-bucket", default="pinaka-bronze")
+    bronze_range.add_argument("--endpoint-url", default="http://localhost:4566")
+    bronze_range.add_argument("--region", default="ap-south-1")
+    bronze_range.add_argument("--max-workers", type=int, default=4)
+    bronze_range.add_argument("--continue-on-error", action="store_true")
+
     args = parser.parse_args()
 
     if args.command == "backfill-plan":
@@ -126,6 +151,33 @@ def main() -> None:
         if args.dataset == "bhavcopy_eq":
             kwargs["lookback_days"] = args.lookback_days
         result = fn(**kwargs)
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    if args.command == "bronze":
+        result = normalize_raw_to_bronze_for_date(
+            dataset=args.dataset,
+            trade_date=parse_date(args.trade_date),
+            raw_bucket=args.raw_bucket,
+            bronze_bucket=args.bronze_bucket,
+            endpoint_url=args.endpoint_url,
+            region_name=args.region,
+        )
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    if args.command == "bronze-range":
+        result = normalize_raw_to_bronze_range(
+            dataset=args.dataset,
+            start_date=parse_date(args.start_date),
+            end_date=parse_date(args.end_date),
+            raw_bucket=args.raw_bucket,
+            bronze_bucket=args.bronze_bucket,
+            endpoint_url=args.endpoint_url,
+            region_name=args.region,
+            max_workers=args.max_workers,
+            continue_on_error=args.continue_on_error,
+        )
         print(json.dumps(result, indent=2, default=str))
         return
 

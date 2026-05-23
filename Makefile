@@ -3,7 +3,7 @@ SHELL := /bin/bash
 DOCKER_COMPOSE := COMPOSE_PROJECT_NAME=pinaka docker compose -f infra/docker/docker-compose.yml --env-file infra/docker/.env
 
 .PHONY: up down logs ps health ministack-init backfill-plan backfill-run \
-	ingestion-image ingest ingest-range
+	ingestion-image ingest ingest-range bronze bronze-range gold gold-range rebuild
 
 up:
 	$(DOCKER_COMPOSE) up -d --build
@@ -56,6 +56,27 @@ ingest-range: ingestion-image
 		--region ap-south-1 \
 		--continue-on-error
 
+bronze: ingestion-image
+	docker run --rm --network pinaka_default pinaka-ingestion-worker python -m pinaka_ingestion.cli bronze \
+		--dataset $${DATASET:-bhavcopy_eq} \
+		--trade-date $${TRADE_DATE:-2026-05-22} \
+		--raw-bucket pinaka-raw \
+		--bronze-bucket pinaka-bronze \
+		--endpoint-url http://ministack:4566 \
+		--region ap-south-1
+
+bronze-range: ingestion-image
+	docker run --rm --network pinaka_default pinaka-ingestion-worker python -m pinaka_ingestion.cli bronze-range \
+		--dataset $${DATASET:-bhavcopy_eq} \
+		--start-date $${START_DATE:-2026-05-18} \
+		--end-date $${END_DATE:-2026-05-22} \
+		--raw-bucket pinaka-raw \
+		--bronze-bucket pinaka-bronze \
+		--endpoint-url http://ministack:4566 \
+		--region ap-south-1 \
+		--max-workers $${MAX_WORKERS:-4} \
+		--continue-on-error
+
 gold: ingestion-image
 	docker run --rm --network pinaka_default pinaka-ingestion-worker python -m pinaka_ingestion.cli gold \
 		--dataset $${DATASET:-bhavcopy_eq} \
@@ -65,6 +86,9 @@ gold: ingestion-image
 		--endpoint-url http://ministack:4566 \
 		--region ap-south-1 \
 		--lookback-days $${LOOKBACK_DAYS:-60}
+
+rebuild:
+	bash scripts/rebuild.sh
 
 gold-range: ingestion-image
 	docker run --rm --network pinaka_default pinaka-ingestion-worker python -m pinaka_ingestion.cli gold-range \

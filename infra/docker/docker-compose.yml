@@ -7,6 +7,10 @@ services:
     environment:
       - MINISTACK_REGION=ap-south-1
       - MINISTACK_ACCOUNT_ID=000000000000
+      - S3_PERSIST=1
+      - S3_DATA_DIR=/tmp/ministack-data/s3
+    volumes:
+      - ministack_s3_data:/tmp/ministack-data/s3
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health', timeout=5).read()"]
       interval: 10s
@@ -104,3 +108,4 @@ services:
 
 volumes:
   postgres_data:
+  ministack_s3_data:
