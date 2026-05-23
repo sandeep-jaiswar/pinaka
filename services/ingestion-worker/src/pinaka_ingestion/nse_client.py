@@ -103,12 +103,21 @@ def fetch_bhavcopy_eq(trade_date: date) -> dict:
 
 
 def fetch_corp_actions(trade_date: date) -> dict:
+    from datetime import timedelta
     from nselib import capital_market
 
-    fn_name, rows = _try_extract(trade_date, [
-        ("corporate_actions_for_equity", getattr(capital_market, "corporate_actions_for_equity", None)),
-    ])
-    return _make_result("corp_actions", trade_date, fn_name, rows)
+    trade_date_ddmmyyyy = trade_date.strftime("%d-%m-%Y")
+    next_date_ddmmyyyy = (trade_date + timedelta(days=1)).strftime("%d-%m-%Y")
+    fn = getattr(capital_market, "corporate_actions_for_equity", None)
+    if fn:
+        frame_like = fn(from_date=trade_date_ddmmyyyy, to_date=next_date_ddmmyyyy)
+        rows = _rows_from_frame_like(frame_like)
+        return _make_result("corp_actions", trade_date, "corporate_actions_for_equity", rows)
+
+    raise NseLibError(
+        f"Failed to extract for {trade_date.isoformat()}. "
+        "corporate_actions_for_equity: function not found in nselib.capital_market"
+    )
 
 
 def fetch_index_constituents(trade_date: date) -> dict:
@@ -138,13 +147,21 @@ def fetch_fo_oi(trade_date: date) -> dict:
 
 
 def fetch_block_deals(trade_date: date) -> dict:
+    from datetime import timedelta
     from nselib import capital_market
 
-    fn_name, rows = _try_extract(trade_date, [
-        ("get_block_deals_data", getattr(capital_market, "get_block_deals_data", None)),
-        ("block_deals_data", getattr(capital_market, "block_deals_data", None)),
-    ])
-    return _make_result("block_deals", trade_date, fn_name, rows)
+    trade_date_ddmmyyyy = trade_date.strftime("%d-%m-%Y")
+    next_date_ddmmyyyy = (trade_date + timedelta(days=1)).strftime("%d-%m-%Y")
+    fn = getattr(capital_market, "block_deals_data", None)
+    if fn:
+        frame_like = fn(from_date=trade_date_ddmmyyyy, to_date=next_date_ddmmyyyy)
+        rows = _rows_from_frame_like(frame_like)
+        return _make_result("block_deals", trade_date, "block_deals_data", rows)
+
+    raise NseLibError(
+        f"Failed to extract for {trade_date.isoformat()}. "
+        "block_deals_data: function not found in nselib.capital_market"
+    )
 
 
 EXTRACTORS: dict[str, Callable[[date], dict]] = {
