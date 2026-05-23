@@ -55,3 +55,26 @@ ingest-range: ingestion-image
 		--endpoint-url http://ministack:4566 \
 		--region ap-south-1 \
 		--continue-on-error
+
+gold: ingestion-image
+	docker run --rm --network pinaka_default pinaka-ingestion-worker python -m pinaka_ingestion.cli gold \
+		--dataset $${DATASET:-bhavcopy_eq} \
+		--trade-date $${TRADE_DATE:-2026-05-22} \
+		--bronze-bucket pinaka-bronze \
+		--gold-bucket pinaka-gold \
+		--endpoint-url http://ministack:4566 \
+		--region ap-south-1 \
+		--lookback-days $${LOOKBACK_DAYS:-60}
+
+gold-range: ingestion-image
+	docker run --rm --network pinaka_default pinaka-ingestion-worker python -m pinaka_ingestion.cli gold-range \
+		--dataset $${DATASET:-bhavcopy_eq} \
+		--start-date $${START_DATE:-2024-01-01} \
+		--end-date $${END_DATE:-2026-05-23} \
+		--bronze-bucket pinaka-bronze \
+		--gold-bucket pinaka-gold \
+		--endpoint-url http://ministack:4566 \
+		--region ap-south-1 \
+		--lookback-days $${LOOKBACK_DAYS:-60} \
+		--max-workers $${MAX_WORKERS:-4} \
+		--continue-on-error

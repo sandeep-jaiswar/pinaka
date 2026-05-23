@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import io
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
-from typing import Any
 from uuid import uuid4
 
 import polars as pl
 
-from ..s3_raw import _s3_client, current_utc_iso, put_payload_json
+from ..s3_raw import _s3_client, put_payload_parquet
 
 
 def _collect_bronze_range(
@@ -22,7 +22,7 @@ def _collect_bronze_range(
     max_workers: int = 8,
 ) -> list[dict]:
     client = _s3_client(endpoint_url=endpoint_url, region_name=region_name)
-    all_keys: list[tuple[str, str]] = []
+    all_entries: list[tuple[str, str, str]] = []
 
     cursor = start_date
     while cursor <= end_date:
@@ -34,8 +34,11 @@ def _collect_bronze_range(
                 kwargs["ContinuationToken"] = token
             resp = client.list_objects_v2(**kwargs)
             for item in resp.get("Contents", []):
-                if item["Key"].endswith(".parquet"):
-                    all_keys.append((item["Key"], cursor.isoformat()))
+                key = item["Key"]
+                if key.endswith(".parquet"):
+                    all_entries.append((key, cursor.isoformat(), "parquet"))
+                elif key.endswith(".json"):
+                    all_entries.append((key, cursor.isoformat(), "json"))
             if not resp.get("IsTruncated"):
                 break
             token = resp.get("NextContinuationToken")
@@ -44,8 +47,11 @@ def _collect_bronze_range(
     all_records: list[dict] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {}
-        for key, dt_str in all_keys:
-            fut = pool.submit(_download_s3_parquet, client, bucket, key)
+        for key, dt_str, fmt in all_entries:
+            if fmt == "parquet":
+                fut = pool.submit(_download_s3_parquet, client, bucket, key)
+            else:
+                fut = pool.submit(_download_s3_json, client, bucket, key)
             futures[fut] = dt_str
 
         for fut in as_completed(futures):
@@ -65,6 +71,15 @@ def _download_s3_parquet(client, bucket: str, key: str) -> list[dict]:
     obj = client.get_object(Bucket=bucket, Key=key)
     buf = io.BytesIO(obj["Body"].read())
     return pl.read_parquet(buf).to_dicts()
+
+
+def _download_s3_json(client, bucket: str, key: str) -> list[dict]:
+    obj = client.get_object(Bucket=bucket, Key=key)
+    payload = json.loads(obj["Body"].read().decode("utf-8"))
+    records = payload.get("records", [])
+    if isinstance(records, list) and records and isinstance(records[0], dict):
+        return records
+    return []
 
 
 def compute_fo_oi_features_for_date(
@@ -117,34 +132,18 @@ def compute_fo_oi_features_for_date(
          / (pl.col("option_index_call_long") + pl.col("option_stock_call_long")).clip(1)).alias("put_call_ratio"),
     ])
 
-    records = df.to_dicts()
-    for r in records:
-        for k, v in r.items():
-            if isinstance(v, float | int) and v != v:
-                r[k] = None
-        r["trade_date"] = trade_date.isoformat()
-
     run_id = uuid4().hex
-    object_key = f"features/{dataset}/dt={trade_date.isoformat()}/run_id={run_id}/features.json"
+    object_key = f"features/{dataset}/dt={trade_date.isoformat()}/run_id={run_id}/features.parquet"
 
-    payload = {
-        "dataset": dataset,
-        "trade_date": trade_date.isoformat(),
-        "gold_at_utc": current_utc_iso(),
-        "run_id": run_id,
-        "records": len(records),
-        "records": records,
-    }
-
-    s3_uri = put_payload_json(
-        bucket=gold_bucket, key=object_key, payload=payload,
+    s3_uri = put_payload_parquet(
+        bucket=gold_bucket, key=object_key, df=df,
         endpoint_url=endpoint_url, region_name=region_name,
     )
 
     return {
         "dataset": dataset,
         "trade_date": trade_date.isoformat(),
-        "records": len(records),
+        "records": df.height,
         "bucket": gold_bucket,
         "object_key": object_key,
         "s3_uri": s3_uri,
@@ -250,50 +249,23 @@ def compute_features_for_date(
         (pl.col("macd") - pl.col("macd_signal")).alias("macd_histogram")
     )
 
-    target = df.filter(pl.col("trade_date") == trade_date.isoformat())
-
-    records = target.select([
-        "symbol",
-        "trade_date",
-        "close",
-        "totaltradedquantity",
-        "sma_20",
-        "ema_20",
-        "rsi_14",
-        "macd",
-        "macd_signal",
-        "macd_histogram",
-    ]).to_dicts()
-
-    for r in records:
-        for k, v in r.items():
-            if isinstance(v, float | int) and v != v:
-                r[k] = None
+    target = df.filter(pl.col("trade_date") == trade_date.isoformat()).select([
+        "symbol", "trade_date", "close", "totaltradedquantity",
+        "sma_20", "ema_20", "rsi_14", "macd", "macd_signal", "macd_histogram",
+    ])
 
     run_id = uuid4().hex
-    object_key = f"features/{dataset}/dt={trade_date.isoformat()}/run_id={run_id}/features.json"
+    object_key = f"features/{dataset}/dt={trade_date.isoformat()}/run_id={run_id}/features.parquet"
 
-    payload = {
-        "dataset": dataset,
-        "trade_date": trade_date.isoformat(),
-        "gold_at_utc": current_utc_iso(),
-        "run_id": run_id,
-        "symbols": len(records),
-        "records": records,
-    }
-
-    s3_uri = put_payload_json(
-        bucket=gold_bucket,
-        key=object_key,
-        payload=payload,
-        endpoint_url=endpoint_url,
-        region_name=region_name,
+    s3_uri = put_payload_parquet(
+        bucket=gold_bucket, key=object_key, df=target,
+        endpoint_url=endpoint_url, region_name=region_name,
     )
 
     return {
         "dataset": dataset,
         "trade_date": trade_date.isoformat(),
-        "symbols": len(records),
+        "symbols": target.height,
         "bucket": gold_bucket,
         "object_key": object_key,
         "s3_uri": s3_uri,
