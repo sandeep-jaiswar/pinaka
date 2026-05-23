@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.venv/
+
+# Env
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Data and runtime
+/tmp/
+*.log
+*.db
+
+# Dagster / Airflow style artifacts
+storage/
+dagster_home/history/
+dagster_home/schedules/
+dagster_home/logs/

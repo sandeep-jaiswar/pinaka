@@ -1,0 +1,4 @@
+load_from:
+  - python_file:
+      relative_path: ../repo/repository.py
+      location_name: pinaka_repo

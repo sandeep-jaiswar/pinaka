@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pinaka-ingestion-worker"
+version = "0.1.0"
+description = "Pinaka ingestion worker for NSE datasets"
+requires-python = ">=3.11"
+dependencies = [
+  "nselib>=2.5.1",
+  "pydantic>=2.8.0",
+  "python-dateutil>=2.9.0",
+  "psycopg[binary]>=3.2.0",
+  "boto3>=1.35.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
