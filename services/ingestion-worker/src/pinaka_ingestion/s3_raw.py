@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 from datetime import datetime, timezone
 from uuid import uuid4
+
+import polars as pl
 
 
 def _s3_client(*, endpoint_url: str, region_name: str):
@@ -42,6 +45,22 @@ def put_payload_json(
 
     body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str).encode("utf-8")
     client.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+    return f"s3://{bucket}/{key}"
+
+
+def put_payload_parquet(
+    *,
+    bucket: str,
+    key: str,
+    df: pl.DataFrame,
+    endpoint_url: str,
+    region_name: str,
+) -> str:
+    client = _s3_client(endpoint_url=endpoint_url, region_name=region_name)
+    buf = io.BytesIO()
+    df.write_parquet(buf)
+    buf.seek(0)
+    client.put_object(Bucket=bucket, Key=key, Body=buf, ContentType="application/octet-stream")
     return f"s3://{bucket}/{key}"
 
 

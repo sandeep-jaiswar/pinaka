@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from typing import Any
@@ -34,7 +34,8 @@ def _collect_bronze_range(
                 kwargs["ContinuationToken"] = token
             resp = client.list_objects_v2(**kwargs)
             for item in resp.get("Contents", []):
-                all_keys.append((item["Key"], cursor.isoformat()))
+                if item["Key"].endswith(".parquet"):
+                    all_keys.append((item["Key"], cursor.isoformat()))
             if not resp.get("IsTruncated"):
                 break
             token = resp.get("NextContinuationToken")
@@ -44,7 +45,7 @@ def _collect_bronze_range(
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {}
         for key, dt_str in all_keys:
-            fut = pool.submit(_download_s3_json, client, bucket, key)
+            fut = pool.submit(_download_s3_parquet, client, bucket, key)
             futures[fut] = dt_str
 
         for fut in as_completed(futures):
@@ -60,10 +61,10 @@ def _collect_bronze_range(
     return all_records
 
 
-def _download_s3_json(client, bucket: str, key: str) -> list[dict]:
+def _download_s3_parquet(client, bucket: str, key: str) -> list[dict]:
     obj = client.get_object(Bucket=bucket, Key=key)
-    payload = json.loads(obj["Body"].read().decode("utf-8"))
-    return payload.get("records", [])
+    buf = io.BytesIO(obj["Body"].read())
+    return pl.read_parquet(buf).to_dicts()
 
 
 def compute_fo_oi_features_for_date(

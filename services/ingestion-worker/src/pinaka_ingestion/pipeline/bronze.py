@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import date
 from uuid import uuid4
 
+import polars as pl
+
 from ..s3_raw import (
-    current_utc_iso,
-    put_payload_json,
+    put_payload_parquet,
 )
 
 
@@ -37,14 +38,12 @@ _BRONZE_COLUMN_MAP: dict[str, dict[str, str]] = {
     },
     "corp_actions": {
         "symbol": "symbol",
-        "ex_date": "ex_date",
-        "purpose": "purpose",
-        "action_type": "action_type",
-        "face_value": "face_value",
-        "record_date": "record_date",
-        "bc_start_date": "bc_start_date",
-        "bc_end_date": "bc_end_date",
-        "trade_date": "trade_date",
+        "exDate": "ex_date",
+        "subject": "purpose",
+        "faceVal": "face_value",
+        "recDate": "record_date",
+        "bcStartDate": "bc_start_date",
+        "bcEndDate": "bc_end_date",
     },
     "index_constituents": {
         "symbol": "symbol",
@@ -90,13 +89,16 @@ _BRONZE_COLUMN_MAP: dict[str, dict[str, str]] = {
         "trade_date": "trade_date",
     },
     "block_deals": {
+        "Symbol": "symbol",
         "symbol": "symbol",
+        "ClientName": "client_name",
         "client_name": "client_name",
-        "deal_type": "deal_type",
-        "quantity": "quantity",
-        "price": "price",
-        "value": "value",
-        "trade_date": "trade_date",
+        "Buy/Sell": "deal_type",
+        "buy_sell": "deal_type",
+        "QuantityTraded": "quantity",
+        "quantity_traded": "quantity",
+        "TradePrice/Wght.Avg.Price": "price",
+        "tradeprice_wght_avg_price": "price",
     },
 }
 
@@ -147,30 +149,24 @@ def normalize_to_bronze(
     region_name: str = "ap-south-1",
 ) -> dict:
     normalized = [_normalize_record(dataset, r) for r in raw_records if r]
-    object_key = f"nse/{dataset}/dt={trade_date}/run_id={run_id}/bronze.json"
+    object_key = f"nse/{dataset}/dt={trade_date}/run_id={run_id}/part-00000.parquet"
 
-    payload = {
-        "dataset": dataset,
-        "trade_date": trade_date,
-        "bronze_at_utc": current_utc_iso(),
-        "run_id": run_id,
-        "source": "nselib",
-        "row_count": len(normalized),
-        "records": normalized,
-    }
-
-    s3_uri = put_payload_json(
-        bucket=bucket,
-        key=object_key,
-        payload=payload,
-        endpoint_url=endpoint_url,
-        region_name=region_name,
-    )
+    row_count = len(normalized)
+    s3_uri = None
+    if row_count > 0:
+        df = pl.DataFrame(normalized)
+        s3_uri = put_payload_parquet(
+            bucket=bucket,
+            key=object_key,
+            df=df,
+            endpoint_url=endpoint_url,
+            region_name=region_name,
+        )
 
     return {
         "dataset": dataset,
         "trade_date": trade_date,
-        "row_count": len(normalized),
+        "row_count": row_count,
         "bucket": bucket,
         "object_key": object_key,
         "s3_uri": s3_uri,

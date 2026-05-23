@@ -32,7 +32,7 @@ from pinaka_ingestion.pipeline.gold import (
     compute_features_for_date,
     compute_fo_oi_features_for_date,
 )
-from pinaka_ingestion.pipeline.duckdb_layer import refresh_gold_tables
+from pinaka_ingestion.pipeline.duckdb_layer import get_connection
 from pinaka_ingestion.s3_raw import _s3_client
 
 _ENDPOINT_URL = os.getenv("PINAKA_MINISTACK_ENDPOINT", "http://ministack:4566")
@@ -191,28 +191,24 @@ def make_gold_asset(dataset: str):
 def make_duckdb_asset():
     @asset(
         name="duckdb_refresh",
-        partitions_def=daily_partitions,
         kinds={"duckdb", "s3"},
-        description="Refresh DuckDB materialized tables from gold/bronze S3 data",
+        description="Recreate DuckDB S3-backed views for bronze/gold data",
         group_name="analytics",
-        deps=[
-            AssetKey("bhavcopy_eq_features"),
-            AssetKey("fo_oi_features"),
-        ],
     )
     def _asset(context: AssetExecutionContext) -> None:
-        trade_date = datetime.strptime(context.partition_key, "%Y-%m-%d").date()
-        context.log.info("Refreshing DuckDB tables for %s", trade_date)
+        context.log.info("Recreating DuckDB S3 views")
 
-        result = refresh_gold_tables(
-            trade_dates=[trade_date],
-            gold_bucket=_GOLD_BUCKET,
+        con = get_connection(
             bronze_bucket=_BRONZE_BUCKET,
             endpoint_url=_ENDPOINT_URL,
             region_name=_AWS_REGION,
         )
+        views = con.execute(
+            "SELECT table_name FROM information_schema.views WHERE table_schema='main'"
+        ).fetchall()
+        con.close()
 
-        context.log.info("DuckDB refreshed: %s", result)
+        context.log.info("DuckDB views ready: %s", [v[0] for v in views])
 
     _asset.__name__ = "duckdb_refresh"
     return _asset

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -10,110 +8,99 @@ import polars as pl
 
 from ..s3_raw import _s3_client
 
-
 _DEFAULT_DB_PATH = Path("/tmp/pinaka.duckdb")
 
+_BRONZE_DATASETS = [
+    "bhavcopy_eq",
+    "fo_oi",
+    "corp_actions",
+    "index_constituents",
+    "block_deals",
+]
 
-def _fetch_gold_records(
+
+def _configure_s3(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute("INSTALL httpfs")
+    con.execute("LOAD httpfs")
+    con.execute("SET s3_endpoint='ministack:4566'")
+    con.execute("SET s3_use_ssl=false")
+    con.execute("SET s3_access_key_id='test'")
+    con.execute("SET s3_secret_access_key='test'")
+    con.execute("SET s3_url_style='path'")
+    con.execute("SET s3_region='ap-south-1'")
+
+
+def _s3_path(bucket: str, prefix: str) -> str:
+    return f"s3://{bucket}/{prefix}"
+
+
+def _check_has_data(dataset: str, bucket: str, endpoint_url: str, region_name: str) -> bool:
+    client = _s3_client(endpoint_url=endpoint_url, region_name=region_name)
+    prefix = f"nse/{dataset}/"
+    token = None
+    while True:
+        kwargs = dict(Bucket=bucket, Prefix=prefix, MaxKeys=100)
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = client.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents", []):
+            if obj["Key"].endswith(".parquet"):
+                return True
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    return False
+
+
+def _create_bronze_view(
+    con: duckdb.DuckDBPyConnection,
     dataset: str,
-    trade_date: date,
     bucket: str,
     endpoint_url: str,
     region_name: str,
-) -> pl.DataFrame:
-    client = _s3_client(endpoint_url=endpoint_url, region_name=region_name)
-    prefix = f"features/{dataset}/dt={trade_date.isoformat()}/"
-    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix)
-    frames: list[pl.DataFrame] = []
-    for obj in resp.get("Contents", []):
-        payload = json.loads(
-            client.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read().decode("utf-8")
-        )
-        recs = payload.get("records", [])
-        if recs:
-            df = pl.DataFrame(recs)
-            df = df.with_columns([
-                pl.lit(dataset).alias("_dataset"),
-                pl.lit(trade_date.isoformat()).alias("_partition_date"),
-            ])
-            frames.append(df)
-    return pl.concat(frames) if frames else pl.DataFrame()
+) -> None:
+    view_name = f"bronze_{dataset.replace('-', '_')}"
+    pattern = _s3_path(bucket, f"nse/{dataset}/**/part-00000.parquet")
+
+    if not _check_has_data(dataset, bucket, endpoint_url, region_name):
+        con.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT NULL::VARCHAR AS _empty WHERE FALSE")
+        return
+
+    con.execute(
+        f"CREATE OR REPLACE VIEW {view_name} AS "
+        f"SELECT * FROM read_parquet('{pattern}', hive_partitioning=true)"
+    )
 
 
-def _fetch_bronze_records(
-    dataset: str,
-    trade_date: date,
-    bucket: str,
-    endpoint_url: str,
-    region_name: str,
-) -> pl.DataFrame:
-    client = _s3_client(endpoint_url=endpoint_url, region_name=region_name)
-    prefix = f"nse/{dataset}/dt={trade_date.isoformat()}/"
-    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix)
-    frames: list[pl.DataFrame] = []
-    for obj in resp.get("Contents", []):
-        payload = json.loads(
-            client.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read().decode("utf-8")
-        )
-        recs = payload.get("records", [])
-        if recs:
-            df = pl.DataFrame(recs)
-            df = df.with_columns([
-                pl.lit(dataset).alias("_dataset"),
-                pl.lit(trade_date.isoformat()).alias("_partition_date"),
-            ])
-            frames.append(df)
-    return pl.concat(frames) if frames else pl.DataFrame()
+def _list_views(con: duckdb.DuckDBPyConnection) -> set[str]:
+    rows = con.execute("SELECT table_name FROM information_schema.views WHERE table_schema='main'").fetchall()
+    return {r[0] for r in rows}
 
 
-def refresh_gold_tables(
+def get_connection(
     *,
-    trade_dates: list[date],
-    gold_bucket: str = "pinaka-gold",
     bronze_bucket: str = "pinaka-bronze",
     endpoint_url: str = "http://ministack:4566",
     region_name: str = "ap-south-1",
     db_path: Path = _DEFAULT_DB_PATH,
-) -> dict[str, int]:
+) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect(str(db_path))
-    totals: dict[str, int] = {}
+    _configure_s3(con)
 
-    gold_datasets = ["bhavcopy_eq", "fo_oi"]
-    for ds in gold_datasets:
-        frames: list[pl.DataFrame] = []
-        for td in trade_dates:
-            frames.append(_fetch_gold_records(ds, td, gold_bucket, endpoint_url, region_name))
-        df = pl.concat([f for f in frames if f.height > 0]) if frames else pl.DataFrame()
-        table_name = f"gold_{ds.replace('-', '_')}"
-        con.execute(f"DROP TABLE IF EXISTS {table_name}")
-        if df.height > 0:
-            con.register("_tmp_df", df)
-            con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM _tmp_df")
-            con.unregister("_tmp_df")
-        totals[f"gold_{ds}"] = df.height
+    existing = _list_views(con)
+    expected = {f"bronze_{ds.replace('-', '_')}" for ds in _BRONZE_DATASETS}
+    if not expected.issubset(existing):
+        for ds in _BRONZE_DATASETS:
+            _create_bronze_view(con, ds, bronze_bucket, endpoint_url, region_name)
 
-    bronze_datasets = ["bhavcopy_eq", "fo_oi"]
-    for ds in bronze_datasets:
-        frames: list[pl.DataFrame] = []
-        for td in trade_dates:
-            frames.append(
-                _fetch_bronze_records(ds, td, bronze_bucket, endpoint_url, region_name)
-            )
-        df = pl.concat([f for f in frames if f.height > 0]) if frames else pl.DataFrame()
-        table_name = f"bronze_{ds.replace('-', '_')}"
-        con.execute(f"DROP TABLE IF EXISTS {table_name}")
-        if df.height > 0:
-            con.register("_tmp_df", df)
-            con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM _tmp_df")
-            con.unregister("_tmp_df")
-        totals[f"bronze_{ds}"] = df.height
-
-    con.close()
-    return totals
+    return con
 
 
-def query(sql: str, db_path: Path = _DEFAULT_DB_PATH) -> pl.DataFrame:
-    con = duckdb.connect(str(db_path))
+def query(
+    sql: str,
+    db_path: Path = _DEFAULT_DB_PATH,
+) -> pl.DataFrame:
+    con = get_connection(db_path=db_path)
     result = con.execute(sql).pl()
     con.close()
     return result
