@@ -3,17 +3,13 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pinaka-ingestion-worker"
+name = "pinaka-common"
 version = "0.1.0"
-description = "Pinaka ingestion worker for NSE datasets"
+description = "Pinaka shared Python utilities"
 requires-python = ">=3.11"
 dependencies = [
-  "nselib>=2.5.1",
-  "pydantic>=2.8.0",
-  "python-dateutil>=2.9.0",
-  "psycopg[binary]>=3.2.0",
   "boto3>=1.35.0",
-  "pinaka-common"
+  "pydantic>=2.8.0",
 ]
 
 [tool.setuptools.packages.find]

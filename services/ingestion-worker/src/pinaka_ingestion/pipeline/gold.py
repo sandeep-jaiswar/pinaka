@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import io
-import json
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
+from threading import Lock
 from uuid import uuid4
 
 import polars as pl
 
+from pinaka_common.cloud import list_all_keys
 from ..s3_raw import _s3_client, put_payload_parquet
+
+logger = logging.getLogger(__name__)
+
+
+def _download_s3_parquet(client, bucket: str, key: str) -> list[dict]:
+    obj = client.get_object(Bucket=bucket, Key=key)
+    buf = io.BytesIO(obj["Body"].read())
+    return pl.read_parquet(buf).to_dicts()
 
 
 def _collect_bronze_range(
@@ -22,37 +32,23 @@ def _collect_bronze_range(
     max_workers: int = 8,
 ) -> list[dict]:
     client = _s3_client(endpoint_url=endpoint_url, region_name=region_name)
-    all_entries: list[tuple[str, str, str]] = []
+    parquet_keys: list[tuple[str, str]] = []
 
     cursor = start_date
     while cursor <= end_date:
         prefix = f"nse/{dataset}/dt={cursor.isoformat()}/"
-        token = None
-        while True:
-            kwargs = dict(Bucket=bucket, Prefix=prefix)
-            if token:
-                kwargs["ContinuationToken"] = token
-            resp = client.list_objects_v2(**kwargs)
-            for item in resp.get("Contents", []):
-                key = item["Key"]
-                if key.endswith(".parquet"):
-                    all_entries.append((key, cursor.isoformat(), "parquet"))
-                elif key.endswith(".json"):
-                    all_entries.append((key, cursor.isoformat(), "json"))
-            if not resp.get("IsTruncated"):
-                break
-            token = resp.get("NextContinuationToken")
+        for key in list_all_keys(client, bucket, prefix):
+            if key.endswith(".parquet"):
+                parquet_keys.append((key, cursor.isoformat()))
         cursor += timedelta(days=1)
 
     all_records: list[dict] = []
+    records_lock = Lock()
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {}
-        for key, dt_str, fmt in all_entries:
-            if fmt == "parquet":
-                fut = pool.submit(_download_s3_parquet, client, bucket, key)
-            else:
-                fut = pool.submit(_download_s3_json, client, bucket, key)
-            futures[fut] = dt_str
+        futures = {
+            pool.submit(_download_s3_parquet, client, bucket, key): dt_str
+            for key, dt_str in parquet_keys
+        }
 
         for fut in as_completed(futures):
             dt_str = futures[fut]
@@ -60,26 +56,12 @@ def _collect_bronze_range(
                 records = fut.result()
                 for r in records:
                     r["trade_date"] = dt_str
-                all_records.extend(records)
+                with records_lock:
+                    all_records.extend(records)
             except Exception:
-                pass
+                logger.exception("Failed to download bronze parquet for %s", dt_str)
 
     return all_records
-
-
-def _download_s3_parquet(client, bucket: str, key: str) -> list[dict]:
-    obj = client.get_object(Bucket=bucket, Key=key)
-    buf = io.BytesIO(obj["Body"].read())
-    return pl.read_parquet(buf).to_dicts()
-
-
-def _download_s3_json(client, bucket: str, key: str) -> list[dict]:
-    obj = client.get_object(Bucket=bucket, Key=key)
-    payload = json.loads(obj["Body"].read().decode("utf-8"))
-    records = payload.get("records", [])
-    if isinstance(records, list) and records and isinstance(records[0], dict):
-        return records
-    return []
 
 
 def compute_fo_oi_features_for_date(
@@ -182,7 +164,7 @@ def compute_features_for_date(
     df = pl.DataFrame(raw)
 
     str_cols = [s for s in ["symbol", "trade_date"] if s in df.columns]
-    num_cols = [s for s in ["close", "high", "low", "totaltradedquantity", "volume", "open"] if s in df.columns]
+    num_cols = [s for s in ["close", "high", "low", "totaltradedquantity", "open"] if s in df.columns]
 
     df = df.with_columns([
         pl.col(c).cast(pl.Utf8).alias(c) for c in str_cols
@@ -202,7 +184,7 @@ def compute_features_for_date(
     df = df.sort(["symbol", "trade_date"])
 
     df = df.with_columns([
-        pl.col("close").rolling_mean(window_size=20, min_periods=1).over("symbol").alias("sma_20"),
+        pl.col("close").rolling_mean(window_size=20, min_samples=1).over("symbol").alias("sma_20"),
         pl.col("close").ewm_mean(span=20, adjust=False).over("symbol").alias("ema_20"),
     ])
 

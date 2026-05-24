@@ -2,23 +2,11 @@ from __future__ import annotations
 
 import io
 import json
-import os
 from datetime import datetime, timezone
 from uuid import uuid4
 
 import polars as pl
-
-
-def _s3_client(*, endpoint_url: str, region_name: str):
-    import boto3
-
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint_url,
-        region_name=region_name,
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "test"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
-    )
+from pinaka_common.cloud import list_all_keys, new_s3_client
 
 
 def build_raw_object_key(dataset: str, trade_date: str, run_id: str) -> str:
@@ -31,6 +19,10 @@ def generate_run_id() -> str:
 
 def current_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _s3_client(*, endpoint_url: str, region_name: str):
+    return new_s3_client(endpoint_url=endpoint_url, region_name=region_name)
 
 
 def put_payload_json(
@@ -74,28 +66,4 @@ def list_raw_partition_keys(
 ) -> list[str]:
     client = _s3_client(endpoint_url=endpoint_url, region_name=region_name)
     prefix = f"nse/{dataset}/dt={trade_date}/"
-
-    keys: list[str] = []
-    continuation_token = None
-
-    while True:
-        if continuation_token:
-            response = client.list_objects_v2(
-                Bucket=bucket,
-                Prefix=prefix,
-                ContinuationToken=continuation_token,
-            )
-        else:
-            response = client.list_objects_v2(
-                Bucket=bucket,
-                Prefix=prefix,
-            )
-
-        contents = response.get("Contents", [])
-        keys.extend(item["Key"] for item in contents)
-
-        if not response.get("IsTruncated"):
-            break
-        continuation_token = response.get("NextContinuationToken")
-
-    return keys
+    return list_all_keys(client, bucket, prefix)

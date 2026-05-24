@@ -54,7 +54,6 @@ _BRONZE_COLUMN_MAP: dict[str, dict[str, str]] = {
         "trade_date": "trade_date",
     },
     "fo_oi": {
-        "Client Type": "client_type",
         "client_type": "client_type",
         "Future Index Long": "future_index_long",
         "future_index_long": "future_index_long",
@@ -62,7 +61,6 @@ _BRONZE_COLUMN_MAP: dict[str, dict[str, str]] = {
         "future_index_short": "future_index_short",
         "Future Stock Long": "future_stock_long",
         "future_stock_long": "future_stock_long",
-        "Future Stock Short       ": "future_stock_short",
         "Future Stock Short": "future_stock_short",
         "future_stock_short": "future_stock_short",
         "Option Index Call Long": "option_index_call_long",
@@ -81,7 +79,6 @@ _BRONZE_COLUMN_MAP: dict[str, dict[str, str]] = {
         "option_stock_call_short": "option_stock_call_short",
         "Option Stock Put Short": "option_stock_put_short",
         "option_stock_put_short": "option_stock_put_short",
-        "Total Long Contracts      ": "total_long_contracts",
         "Total Long Contracts": "total_long_contracts",
         "total_long_contracts": "total_long_contracts",
         "Total Short Contracts": "total_short_contracts",
@@ -128,8 +125,9 @@ def _normalize_record(dataset: str, record: dict) -> dict:
     allowed = _BRONZE_ALLOWED_FIELDS.get(dataset)
     clean: dict = {}
     for raw_key, value in record.items():
-        norm_key = raw_key.strip().lower().replace(" ", "_").replace("-", "_")
-        canonical = column_map.get(raw_key) or column_map.get(norm_key)
+        stripped_key = raw_key.strip()
+        norm_key = stripped_key.lower().replace(" ", "_").replace("-", "_")
+        canonical = column_map.get(stripped_key) or column_map.get(norm_key)
         if canonical is None:
             continue
         if allowed and canonical not in allowed:
@@ -144,6 +142,7 @@ def normalize_to_bronze(
     raw_records: list[dict],
     trade_date: str,
     run_id: str,
+    source_run_id: str | None = None,
     bucket: str = "pinaka-bronze",
     endpoint_url: str = "http://ministack:4566",
     region_name: str = "ap-south-1",
@@ -171,6 +170,7 @@ def normalize_to_bronze(
         "object_key": object_key,
         "s3_uri": s3_uri,
         "run_id": run_id,
+        "source_run_id": source_run_id,
     }
 
 
@@ -179,6 +179,7 @@ def bronze_dataset_for_date(
     dataset: str,
     trade_date: date,
     raw_records: list[dict],
+    source_run_id: str | None = None,
     bucket: str = "pinaka-bronze",
     endpoint_url: str = "http://ministack:4566",
     region_name: str = "ap-south-1",
@@ -189,6 +190,7 @@ def bronze_dataset_for_date(
         raw_records=raw_records,
         trade_date=trade_date.isoformat(),
         run_id=run_id,
+        source_run_id=source_run_id,
         bucket=bucket,
         endpoint_url=endpoint_url,
         region_name=region_name,

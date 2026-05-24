@@ -1,7 +1,4 @@
-from pydantic import BaseModel, Field
+from __future__ import annotations
 
-
-class IngestionConfig(BaseModel):
-    dataset: str = Field(default="bhavcopy")
-    chunk_days: int = Field(default=30)
-    max_parallel_chunks: int = Field(default=4)
+import os
+from dataclasses import dataclass, field

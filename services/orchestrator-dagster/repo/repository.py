@@ -33,6 +33,7 @@ from pinaka_ingestion.pipeline.gold import (
     compute_fo_oi_features_for_date,
 )
 from pinaka_ingestion.pipeline.duckdb_layer import get_connection
+from pinaka_common.cloud import list_all_keys
 from pinaka_ingestion.s3_raw import _s3_client
 
 _ENDPOINT_URL = os.getenv("PINAKA_MINISTACK_ENDPOINT", "http://ministack:4566")
@@ -60,28 +61,20 @@ class GoldConfig(Config):
 def _list_raw_keys(dataset: str, trade_date_iso: str) -> list[str]:
     client = _s3_client(endpoint_url=_ENDPOINT_URL, region_name=_AWS_REGION)
     prefix = f"nse/{dataset}/dt={trade_date_iso}/"
-    keys: list[str] = []
-    token = None
-    while True:
-        kwargs = dict(Bucket=_RAW_BUCKET, Prefix=prefix)
-        if token:
-            kwargs["ContinuationToken"] = token
-        resp = client.list_objects_v2(**kwargs)
-        keys.extend(item["Key"] for item in resp.get("Contents", []))
-        if not resp.get("IsTruncated"):
-            break
-        token = resp.get("NextContinuationToken")
-    return keys
+    return list_all_keys(client, _RAW_BUCKET, prefix)
 
 
-def _read_s3_records(bucket: str, keys: list[str]) -> list[dict]:
+def _read_raw_payloads(bucket: str, keys: list[str]) -> tuple[list[dict], str | None]:
     client = _s3_client(endpoint_url=_ENDPOINT_URL, region_name=_AWS_REGION)
     records: list[dict] = []
+    source_run_id: str | None = None
     for key in keys:
         obj = client.get_object(Bucket=bucket, Key=key)
         payload = json.loads(obj["Body"].read().decode("utf-8"))
+        if source_run_id is None:
+            source_run_id = payload.get("run_id")
         records.extend(payload.get("records", []))
-    return records
+    return records, source_run_id
 
 
 def make_raw_asset(dataset: str):
@@ -134,13 +127,14 @@ def make_bronze_asset(dataset: str):
             context.log.warning("No raw keys found for %s/%s, skipping bronze", dataset, trade_date_iso)
             return
 
-        raw_records = _read_s3_records(_RAW_BUCKET, raw_keys)
-        context.log.info("Normalizing %s to bronze for %s (%d records)", dataset, trade_date, len(raw_records))
+        raw_records, source_run_id = _read_raw_payloads(_RAW_BUCKET, raw_keys)
+        context.log.info("Normalizing %s to bronze for %s (%d records, raw_run_id=%s)", dataset, trade_date, len(raw_records), source_run_id)
 
         result = bronze_dataset_for_date(
             dataset=dataset,
             trade_date=trade_date,
             raw_records=raw_records,
+            source_run_id=source_run_id,
             bucket=config.bronze_bucket,
             endpoint_url=_ENDPOINT_URL,
             region_name=_AWS_REGION,

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install ruff
+        run: pip install ruff
+      - name: Check formatting
+        run: ruff format --check .
+      - name: Lint
+        run: ruff check .
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: |
+          pip install mypy
+          pip install -e packages/python/pinaka-common
+          pip install -r services/ingestion-worker/requirements.txt
+          pip install -r services/orchestrator-dagster/requirements.txt
+      - name: Run mypy
+        run: mypy services/ packages/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: |
+          pip install pytest
+          pip install -e packages/python/pinaka-common
+          pip install -r services/ingestion-worker/requirements.txt
+      - name: Run tests
+        run: pytest services/ingestion-worker/tests/ -v

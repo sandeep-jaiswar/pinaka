@@ -3,15 +3,17 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
-from .nse_client import EXTRACTORS, NseLibError, PullRequest, RAW_DATASETS
+from .nse_client import EXTRACTORS, RAW_DATASETS
+from pinaka_common.cloud import list_all_keys
 from .s3_raw import (
+    _s3_client,
     build_raw_object_key,
     current_utc_iso,
     generate_run_id,
     list_raw_partition_keys,
     put_payload_json,
 )
-from .state_store import BackfillChunk, build_chunks
+from .state_store import build_chunks
 
 
 def backfill_plan(dataset: str, start_date: date, end_date: date, chunk_days: int) -> list[dict]:
@@ -65,7 +67,6 @@ def ingest_dataset_for_date(
         }
 
     run_id = generate_run_id()
-    request = PullRequest(dataset=dataset, start_date=trade_date, end_date=trade_date)
     extract_result = EXTRACTORS[dataset](trade_date)
     row_count = extract_result.get("row_count", 0)
 
@@ -182,98 +183,6 @@ def ingest_dataset_range(
     }
 
 
-_RAW_BRONZE_BUCKET = "pinaka-bronze"
-
-
-def _bronze_object_key(dataset: str, trade_date: str, run_id: str) -> str:
-    return f"nse/{dataset}/dt={trade_date}/run_id={run_id}/bronze.json"
-
-
-def normalize_to_bronze(
-    *,
-    dataset: str,
-    raw_records: list[dict],
-    trade_date: str,
-    run_id: str,
-    bucket: str,
-    endpoint_url: str,
-    region_name: str,
-) -> dict:
-    normalized = _normalize_records(dataset, raw_records)
-    object_key = _bronze_object_key(dataset, trade_date, run_id)
-
-    payload = {
-        "dataset": dataset,
-        "trade_date": trade_date,
-        "bronze_at_utc": current_utc_iso(),
-        "run_id": run_id,
-        "source": "nselib",
-        "row_count": len(normalized),
-        "records": normalized,
-    }
-
-    s3_uri = put_payload_json(
-        bucket=bucket,
-        key=object_key,
-        payload=payload,
-        endpoint_url=endpoint_url,
-        region_name=region_name,
-    )
-
-    return {
-        "dataset": dataset,
-        "trade_date": trade_date,
-        "row_count": len(normalized),
-        "bucket": bucket,
-        "object_key": object_key,
-        "s3_uri": s3_uri,
-    }
-
-
-_BRONZE_SCHEMAS: dict[str, set[str]] = {
-    "bhavcopy_eq": {
-        "symbol", "series", "open", "high", "low", "close", "last",
-        "prevclose", "totaltradedquantity", "totaltradedvalue",
-        "timestamp", "trade_date",
-    },
-    "deliverable_eq": {
-        "symbol", "delivered_quantity", "delivery_percentage",
-        "total_traded_quantity", "trade_date",
-    },
-    "corp_actions": {
-        "symbol", "ex_date", "purpose", "action_type",
-        "face_value", "record_date", "bc_start_date", "bc_end_date",
-    },
-    "index_constituents": {
-        "symbol", "company_name", "index_name", "weight",
-        "industry", "trade_date",
-    },
-    "fo_oi": {
-        "symbol", "instrument", "expiry_date", "option_type",
-        "strike_price", "open_interest", "change_in_oi",
-        "volume", "trade_date",
-    },
-    "block_deals": {
-        "symbol", "client_name", "deal_type", "quantity",
-        "price", "value", "trade_date",
-    },
-}
-
-
-def _normalize_records(dataset: str, records: list[dict]) -> list[dict]:
-    expected_fields = _BRONZE_SCHEMAS.get(dataset, set())
-    normalized: list[dict] = []
-    for record in records:
-        clean = {}
-        for key, value in record.items():
-            clean_key = key.strip().lower().replace(" ", "_").replace("-", "_")
-            if expected_fields and clean_key not in expected_fields:
-                continue
-            clean[clean_key] = value
-        normalized.append(clean)
-    return normalized
-
-
 def normalize_raw_to_bronze_for_date(
     *,
     dataset: str,
@@ -284,37 +193,30 @@ def normalize_raw_to_bronze_for_date(
     region_name: str = "ap-south-1",
 ) -> dict:
     from .pipeline.bronze import bronze_dataset_for_date
-    from .s3_raw import _s3_client
     import json
 
     trade_date_iso = trade_date.isoformat()
     client = _s3_client(endpoint_url=endpoint_url, region_name=region_name)
     prefix = f"nse/{dataset}/dt={trade_date_iso}/"
-    raw_keys: list[str] = []
-    token = None
-    while True:
-        kwargs = dict(Bucket=raw_bucket, Prefix=prefix)
-        if token:
-            kwargs["ContinuationToken"] = token
-        resp = client.list_objects_v2(**kwargs)
-        raw_keys.extend(item["Key"] for item in resp.get("Contents", []))
-        if not resp.get("IsTruncated"):
-            break
-        token = resp.get("NextContinuationToken")
+    raw_keys = list_all_keys(client, raw_bucket, prefix)
 
     if not raw_keys:
         return {"dataset": dataset, "trade_date": trade_date_iso, "row_count": 0, "skipped": True, "skip_reason": "no_raw_data"}
 
     records: list[dict] = []
+    source_run_id: str | None = None
     for key in raw_keys:
         obj = client.get_object(Bucket=raw_bucket, Key=key)
         payload = json.loads(obj["Body"].read().decode("utf-8"))
+        if source_run_id is None:
+            source_run_id = payload.get("run_id")
         records.extend(payload.get("records", []))
 
     result = bronze_dataset_for_date(
         dataset=dataset,
         trade_date=trade_date,
         raw_records=records,
+        source_run_id=source_run_id,
         bucket=bronze_bucket,
         endpoint_url=endpoint_url,
         region_name=region_name,
@@ -387,10 +289,4 @@ def normalize_raw_to_bronze_range(
     }
 
 
-def ingest_bhavcopy_eq_for_date(**kwargs) -> dict:
-    return ingest_dataset_for_date(dataset="bhavcopy_eq", **kwargs)
 
-
-def ingest_bhavcopy_eq_range(**kwargs) -> dict:
-    kwargs.setdefault("dataset", "bhavcopy_eq")
-    return ingest_dataset_range(**kwargs)
