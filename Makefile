@@ -90,6 +90,23 @@ gold: ingestion-image
 rebuild:
 	bash scripts/rebuild.sh
 
+# ── API & Web (Development) ──────────────────────────────────────────
+
+api-dev:
+	PYTHONPATH=services/api-screening/src uv run uvicorn pinaka_api.main:app --reload --host 0.0.0.0 --port 8000
+
+api-install:
+	pip install -r services/api-screening/requirements.txt
+
+web-dev:
+	cd services/web && npm run dev
+
+web-install:
+	cd services/web && npm install
+
+web-build:
+	cd services/web && npm run build
+
 gold-range: ingestion-image
 	docker run --rm --network pinaka_default pinaka-ingestion-worker python -m pinaka_ingestion.cli gold-range \
 		--dataset $${DATASET:-bhavcopy_eq} \
